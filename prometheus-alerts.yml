@@ -1,0 +1,42 @@
+groups:
+  - name: cln-tracker
+    rules:
+      - alert: ClnTrackerDown
+        expr: absent(cln_tracker_healthy) == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: CLN Prometheus is not exporting Tracker metrics
+
+      - alert: ClnTrackerUnhealthy
+        expr: cln_tracker_healthy == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: CLN Tracker or bwatch is unhealthy
+
+      - alert: ClnTrackerIncident
+        expr: cln_tracker_incident == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Tracker incident for {{ $labels.descriptor }}"
+          description: "{{ $labels.code }} during {{ $labels.operation }}"
+
+      - alert: ClnTrackerBwatchLagging
+        expr: cln_tracker_bwatch_lag_blocks > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: bwatch is lagging behind its Bitcoin backend
+
+      - alert: ClnTrackerBookkeeperInjectionFailure
+        expr: increase(cln_tracker_bookkeeper_failures_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: Tracker failed to inject a Bookkeeper movement
