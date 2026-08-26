@@ -34,6 +34,14 @@ groups:
         annotations:
           summary: bwatch is lagging behind its Bitcoin backend
 
+      - alert: ClnTrackerHistoricalRescanStalled
+        expr: cln_tracker_bwatch_active_rescans > 0 and changes(cln_tracker_bwatch_rescan_blocks_processed[15m]) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: A Tracker historical bwatch rescan has made no progress for 15 minutes
+
       - alert: ClnTrackerBookkeeperInjectionFailure
         expr: increase(cln_tracker_bookkeeper_failures_total[5m]) > 0
         labels:

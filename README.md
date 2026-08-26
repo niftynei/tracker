@@ -40,7 +40,11 @@ Descriptor names are stable identifiers and become Bookkeeper account names.
 They may contain ASCII letters, digits, periods, underscores, and hyphens.
 
 birthheight is the first block height that may contain wallet activity. A
-historical birthheight causes bwatch to rescan. lookahead defaults to 20 and is
+historical birthheight causes bwatch to rescan. Tracker registers a descriptor's
+derived scripts without rescanning them individually, then asks bwatch to rescan
+the descriptor's owner namespace as one wallet set. Bwatch therefore reads each
+historical block once for the whole lookahead instead of once per script, while
+unrelated CLN and plugin watches receive no replay notifications. lookahead defaults to 20 and is
 capped at 100,000. It is a moving gap: when an index is used, tracker extends
 every descriptor branch so that lookahead unused indexes remain watched.
 confirmations defaults to 1 and is capped at 2,016. Tracker durably records a
@@ -106,7 +110,30 @@ Operational health, including bwatch scan progress and persisted incidents:
 
 ~~~console
 lightning-cli tracker-health
+lightning-cli bwatch-status \
+  | jq '.active_rescans[] | {watch_type, owners, current_height, target_height, blocks_processed, blocks_total, progress_percent}'
 ~~~
+
+`bwatch-status.active_rescans` is empty when no historical scan is running.
+Each entry is removed on success or failure; `last_rescan_error` retains the
+most recent incomplete scan. `rescans_completed_total` and
+`rescan_blocks_processed_total` are process-lifetime counters for completed
+passes and successfully completed block work. Tracker exports aggregate active-scan count,
+processed/total blocks, and completion ratio to Prometheus without using watch
+owners or scripts as metric labels.
+
+The same primitive can rescan CLN's onchain wallet without replaying plugin or
+channel watch owners:
+
+~~~console
+lightning-cli rescanwatchset owner_prefix=wallet/ start_block=850000
+~~~
+
+`owner_prefix` must end in `/`. Callers that do not own a namespace can instead
+pass an exact `owners` array. The broad `plugin/` prefix is rejected; select a
+specific descendant such as `plugin/tracker/` or
+`plugin/tracker/treasury/`. The rescan snapshots only matching owners across
+script, outpoint, SCID, and block-depth watches.
 
 Bounded, versioned metrics for a compatible Prometheus exporter:
 
@@ -212,8 +239,8 @@ curl -k -X POST https://127.0.0.1:3010/v1/tracker-health \
 ~~~
 
 `prometheus-alerts.yml` contains a ready-to-load rule group for plugin
-availability, Tracker health, descriptor incidents, bwatch lag, and Bookkeeper
-injection failures.
+availability, Tracker health, descriptor incidents, bwatch lag, stalled
+historical rescans, and Bookkeeper injection failures.
 
 Useful alerts include `cln_tracker_healthy == 0`,
 `cln_tracker_bwatch_lag_blocks > 2`, and any `cln_tracker_incident == 1`. Descriptor
