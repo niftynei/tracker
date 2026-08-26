@@ -1,0 +1,25 @@
+[package]
+name = "cln-tracker"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "A Core Lightning plugin for tracking wallet output descriptors with bwatch"
+
+[dependencies]
+anyhow = "1.0"
+cln-plugin = "0.7.0"
+cln-rpc = "0.7.0"
+hex = "0.4"
+log = "0.4"
+miniscript = { version = "13.1.0", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.47", features = ["macros", "rt", "sync"] }
+
+[dev-dependencies]
+pretty_assertions = "1.4"
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"
