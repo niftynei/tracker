@@ -15,6 +15,19 @@ pub struct BwatchError {
 }
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
+pub struct BwatchRescan {
+    pub watch_type: String,
+    #[serde(default)]
+    pub owners: Vec<String>,
+    pub start_height: u32,
+    pub current_height: u32,
+    pub target_height: u32,
+    pub blocks_processed: u64,
+    pub blocks_total: u64,
+    pub progress_percent: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
 pub struct BwatchStatus {
     pub enabled: bool,
     pub current_height: u32,
@@ -28,6 +41,8 @@ pub struct BwatchStatus {
     pub last_poll_error: Option<BwatchError>,
     #[serde(default)]
     pub last_rescan_error: Option<BwatchError>,
+    #[serde(default)]
+    pub active_rescans: Vec<BwatchRescan>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -51,22 +66,62 @@ pub async fn bwatch_status(path: &Path) -> Result<BwatchStatus> {
         .context("decoding bwatch-status response")
 }
 
-pub async fn add_script_watch(
+pub async fn add_script_watches(
     path: &Path,
-    owner: &str,
-    scriptpubkey: &str,
+    watches: &[(String, String)],
     birthheight: u32,
 ) -> Result<()> {
-    call(
-        path,
-        "addscriptpubkeywatch",
-        json!({
-            "owner": owner,
-            "scriptpubkey": scriptpubkey,
-            "start_block": birthheight,
-        }),
-    )
-    .await?;
+    if watches.is_empty() {
+        return Ok(());
+    }
+    let params = json!({
+        "watches": watches
+            .iter()
+            .map(|(owner, scriptpubkey)| json!({
+                "owner": owner,
+                "scriptpubkey": scriptpubkey,
+            }))
+            .collect::<Vec<_>>(),
+        "start_block": birthheight,
+        "rescan": false,
+    });
+    let mut rpc = ClnRpc::new(path)
+        .await
+        .with_context(|| format!("connecting to CLN RPC at {}", path.display()))?;
+    rpc.call_raw::<Value, _>("addscriptpubkeywatches", &params)
+        .await
+        .map_err(|error| anyhow!("CLN RPC addscriptpubkeywatches failed: {error:?}"))?;
+    Ok(())
+}
+
+pub async fn rescan_watch_owners(path: &Path, owners: &[String], start_block: u32) -> Result<()> {
+    if owners.is_empty() {
+        return Ok(());
+    }
+    let params = json!({
+        "owners": owners,
+        "start_block": start_block,
+    });
+    let mut rpc = ClnRpc::new(path)
+        .await
+        .with_context(|| format!("connecting to CLN RPC at {}", path.display()))?;
+    rpc.call_raw::<Value, _>("rescanwatchset", &params)
+        .await
+        .map_err(|error| anyhow!("CLN RPC rescanwatchset failed: {error:?}"))?;
+    Ok(())
+}
+
+pub async fn rescan_watch_prefix(path: &Path, owner_prefix: &str, start_block: u32) -> Result<()> {
+    let params = json!({
+        "owner_prefix": owner_prefix,
+        "start_block": start_block,
+    });
+    let mut rpc = ClnRpc::new(path)
+        .await
+        .with_context(|| format!("connecting to CLN RPC at {}", path.display()))?;
+    rpc.call_raw::<Value, _>("rescanwatchset", &params)
+        .await
+        .map_err(|error| anyhow!("CLN RPC rescanwatchset failed: {error:?}"))?;
     Ok(())
 }
 

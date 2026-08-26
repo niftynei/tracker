@@ -434,25 +434,65 @@ async fn reconcile_watches(state: &AppState, record: &DescriptorRecord) -> Resul
         .await?
         .into_iter()
         .collect::<BTreeSet<_>>();
+    let missing = expected
+        .difference(&current)
+        .cloned()
+        .collect::<BTreeSet<_>>();
 
     for watch in current.difference(&expected) {
         cln::del_owned_watch(&state.rpc_path, watch)
             .await
             .with_context(|| format!("removing unexpected watch for '{}'", record.config.name))?;
     }
-    for watch in &expected {
-        match watch {
+
+    let script_watches = missing
+        .iter()
+        .filter_map(|watch| match watch {
             cln::OwnedWatch::Script {
                 owner,
                 scriptpubkey,
-            } => cln::add_script_watch(
-                &state.rpc_path,
-                owner,
-                scriptpubkey,
-                record.config.birthheight,
-            )
+            } => Some((owner.clone(), scriptpubkey.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    cln::add_script_watches(&state.rpc_path, &script_watches, record.config.birthheight)
+        .await
+        .with_context(|| format!("restoring script watches for '{}'", record.config.name))?;
+
+    if record.status == DescriptorStatus::Syncing {
+        // A crash may have happened after only part of a registration batch
+        // was persisted, or after its scan completed but before activation.
+        // Replay the complete descriptor namespace to guarantee coverage; the
+        // persisted movement IDs make this recovery path idempotent.
+        let owner_prefix = format!("plugin/tracker/{}/", record.config.name);
+        cln::rescan_watch_prefix(&state.rpc_path, &owner_prefix, record.config.birthheight)
             .await
-            .with_context(|| format!("restoring script watch for '{}'", record.config.name))?,
+            .with_context(|| format!("rescanning wallet watch set for '{}'", record.config.name))?;
+    } else {
+        // Normal startup/manual reconciliation must not replay owners whose
+        // watches were already intact.  Only newly restored scripts need a
+        // historical scan.
+        let missing_script_owners = script_watches
+            .iter()
+            .map(|(owner, _)| owner.clone())
+            .collect::<Vec<_>>();
+        cln::rescan_watch_owners(
+            &state.rpc_path,
+            &missing_script_owners,
+            record.config.birthheight,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "rescanning restored script watches for '{}'",
+                record.config.name
+            )
+        })?;
+    }
+
+    for watch in &missing {
+        match watch {
+            cln::OwnedWatch::Script { .. } => {}
             cln::OwnedWatch::Outpoint { owner, outpoint } => {
                 let start_block = record
                     .utxos
@@ -975,6 +1015,25 @@ fn metrics_from_health(health: &Value) -> Value {
             })
         })
         .collect::<Vec<_>>();
+    let active_rescans = health
+        .pointer("/bwatch/active_rescans")
+        .and_then(Value::as_array);
+    let rescan_count = active_rescans.map_or(0, Vec::len);
+    let rescan_blocks_processed = active_rescans
+        .into_iter()
+        .flatten()
+        .filter_map(|rescan| rescan.get("blocks_processed").and_then(Value::as_u64))
+        .sum::<u64>();
+    let rescan_blocks_total = active_rescans
+        .into_iter()
+        .flatten()
+        .filter_map(|rescan| rescan.get("blocks_total").and_then(Value::as_u64))
+        .sum::<u64>();
+    let rescan_progress_ratio = if rescan_blocks_total == 0 {
+        0.0
+    } else {
+        rescan_blocks_processed as f64 / rescan_blocks_total as f64
+    };
     let families = vec![
         gauge(
             "healthy",
@@ -1012,6 +1071,26 @@ fn metrics_from_health(health: &Value) -> Value {
             "bwatch_lag_blocks",
             "Number of blocks bwatch is behind the chain tip.",
             number("/bwatch/lag"),
+        ),
+        gauge(
+            "bwatch_active_rescans",
+            "Number of historical bwatch rescans currently in progress.",
+            json!(rescan_count),
+        ),
+        gauge(
+            "bwatch_rescan_blocks_processed",
+            "Blocks processed across active historical bwatch rescans.",
+            json!(rescan_blocks_processed),
+        ),
+        gauge(
+            "bwatch_rescan_blocks_total",
+            "Total blocks across active historical bwatch rescans.",
+            json!(rescan_blocks_total),
+        ),
+        gauge(
+            "bwatch_rescan_progress_ratio",
+            "Aggregate completion ratio across active historical bwatch rescans.",
+            json!(rescan_progress_ratio),
         ),
         counter(
             "reconciliation_failures_total",
@@ -1163,7 +1242,14 @@ mod tests {
                 "code": "bookkeeper_delivery_failed",
                 "operation": "deliver"
             }],
-            "bwatch": { "current_height": 42, "lag": 1 },
+            "bwatch": {
+                "current_height": 42,
+                "lag": 1,
+                "active_rescans": [{
+                    "blocks_processed": 25,
+                    "blocks_total": 100
+                }]
+            },
             "counters": {
                 "reconciliation_failures": 4,
                 "bookkeeper_failures": 5,
@@ -1181,7 +1267,24 @@ mod tests {
             metrics["families"][3]["samples"][0]["labels"]["descriptor"],
             "treasury"
         );
-        assert_eq!(metrics["families"][8]["name"], "reorgs_total");
+        let family = |name: &str| {
+            metrics["families"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|family| family["name"] == name)
+                .unwrap()
+        };
+        assert_eq!(family("bwatch_active_rescans")["samples"][0]["value"], 1);
+        assert_eq!(
+            family("bwatch_rescan_blocks_processed")["samples"][0]["value"],
+            25
+        );
+        assert_eq!(
+            family("bwatch_rescan_progress_ratio")["samples"][0]["value"],
+            0.25
+        );
+        assert_eq!(family("reorgs_total")["name"], "reorgs_total");
     }
 
     #[test]

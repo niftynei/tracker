@@ -184,16 +184,33 @@ async fn handle_deposit(
         .context("persisting observed descriptor deposit")?;
     plugin.state().put_record(updated.clone()).await;
 
-    for script in added_scripts {
-        cln::add_script_watch(
-            &plugin.state().rpc_path,
-            &script_owner(&name, script.branch, script.index),
-            &script.scriptpubkey,
-            updated.config.birthheight,
-        )
-        .await
-        .context("extending descriptor lookahead frontier")?;
-    }
+    let added_watches = added_scripts
+        .into_iter()
+        .map(|script| {
+            (
+                script_owner(&name, script.branch, script.index),
+                script.scriptpubkey,
+            )
+        })
+        .collect::<Vec<_>>();
+    cln::add_script_watches(
+        &plugin.state().rpc_path,
+        &added_watches,
+        updated.config.birthheight,
+    )
+    .await
+    .context("extending descriptor lookahead frontier")?;
+    let added_owners = added_watches
+        .iter()
+        .map(|(owner, _)| owner.clone())
+        .collect::<Vec<_>>();
+    cln::rescan_watch_owners(
+        &plugin.state().rpc_path,
+        &added_owners,
+        updated.config.birthheight,
+    )
+    .await
+    .context("rescanning extended descriptor lookahead frontier")?;
     cln::add_outpoint_watch(
         &plugin.state().rpc_path,
         &outpoint_owner(&name, &outpoint),
