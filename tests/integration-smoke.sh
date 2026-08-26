@@ -73,7 +73,11 @@ cleanup() {
     kill "$bitcoin_pid" 2>/dev/null || true
     wait "$bitcoin_pid" 2>/dev/null || true
   fi
-  rm -rf "$test_root"
+  if [[ "${KEEP_TEST_ROOT:-0}" == 1 ]]; then
+    printf 'preserving integration test data at %s\n' "$test_root" >&2
+  else
+    rm -rf "$test_root"
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -98,6 +102,13 @@ bitcoin-cli \
   -rpcport="$rpc_port" \
   getblockchaininfo >/dev/null
 
+# Give regtest a mature chain before lightningd starts.  Otherwise newer
+# Bitcoin Core/CLN combinations can leave lightningd waiting for initial block
+# download while the test waits for lightning-cli to become available.
+btc_cli -named createwallet wallet_name=tracker-wallet descriptors=true >/dev/null
+mining_address="$(wallet_cli getnewaddress)"
+btc_cli generatetoaddress 101 "$mining_address" >/dev/null
+
 lightningd \
   --lightning-dir="$lightning_dir" \
   --network=regtest \
@@ -113,30 +124,70 @@ lightningd \
   --log-file="$lightning_dir/lightning.log" >/dev/null 2>&1 &
 lightning_pid=$!
 
-for _attempt in $(seq 1 60); do
+for _attempt in $(seq 1 120); do
   if lightning-cli --lightning-dir="$lightning_dir" --network=regtest getinfo >/dev/null 2>&1; then
     break
+  fi
+  if ! kill -0 "$lightning_pid" 2>/dev/null; then
+    fail "lightningd exited during startup (lightningd=$(command -v lightningd), tracker=$(command -v cln-tracker))"
   fi
   sleep 0.25
 done
 
-ln_cli getinfo >/dev/null
+ln_cli getinfo >/dev/null \
+  || fail "lightningd RPC did not become ready (lightningd=$(command -v lightningd), tracker=$(command -v cln-tracker))"
 plugins="$(ln_cli plugin list)"
-echo "$plugins" | jq -e '.plugins[] | select(.name | endswith("/cln-bwatch")) | .active == true' >/dev/null
-echo "$plugins" | jq -e '.plugins[] | select(.name | endswith("/cln-tracker")) | .active == true' >/dev/null
-ln_cli tracker-list | jq -e '.descriptors == []' >/dev/null
-ln_cli tracker-health | jq -e '.healthy == true' >/dev/null
+assert_jq "$plugins" \
+  '.plugins[] | select(.name | endswith("/cln-bwatch")) | .active == true' \
+  'bwatch plugin is not active'
+assert_jq "$plugins" \
+  '.plugins[] | select(.name | endswith("/cln-tracker")) | .active == true' \
+  'tracker plugin is not active'
+assert_jq "$(ln_cli tracker-list)" '.descriptors == []' \
+  'tracker did not start with an empty descriptor set'
 
-# Build a descriptor wallet and give it mature regtest funds.
-btc_cli -named createwallet wallet_name=tracker-wallet descriptors=true >/dev/null
-mining_address="$(wallet_cli getnewaddress)"
-btc_cli generatetoaddress 101 "$mining_address" >/dev/null
+# Build a descriptor from the already-mature regtest wallet.
 wait_for_jq '.bwatch.caught_up == true and .healthy == true' \
   'bwatch did not catch up after initial mining' ln_cli tracker-health >/dev/null
 
 descriptor="$(wallet_cli listdescriptors \
   | jq -er '.descriptors | map(select(.active == true and .internal == false)) | first | .desc')"
 start_height=$(( $(btc_cli getblockcount) + 1 ))
+
+# A wide descriptor registration must scan its historical range once, not once
+# for each derived address.  Use a fresh wallet so this range contains no
+# matching outputs (and therefore no follow-up outpoint rescans).
+btc_cli -named createwallet wallet_name=scan-wallet descriptors=true >/dev/null
+btc_cli -rpcwallet=scan-wallet getnewaddress >/dev/null
+scan_descriptor="$(btc_cli -rpcwallet=scan-wallet listdescriptors \
+  | jq -er '.descriptors | map(select(.active == true and .internal == false)) | first | .desc')"
+scan_before="$(ln_cli bwatch-status)"
+scan_tip="$(jq -er '.current_height' <<<"$scan_before")"
+scan_birth=$((scan_tip - 20))
+if ln_cli rescanwatchset \
+  owner_prefix=plugin/ \
+  start_block="$scan_birth" >/dev/null 2>&1; then
+  fail "bwatch accepted the dangerously broad plugin/ rescan prefix"
+fi
+scan_registered="$(ln_cli tracker-register \
+  name=wide-scan \
+  descriptor="$scan_descriptor" \
+  birthheight="$scan_birth" \
+  lookahead=64 \
+  confirmations=1)"
+assert_jq "$scan_registered" \
+  '.name == "wide-scan" and .lookahead == 64 and .range_end == 64 and .status == "active"' \
+  '64-address descriptor registration returned an unexpected record'
+assert_jq "$(ln_cli listwatch)" \
+  '[.watches[].owners[] | select(startswith("plugin/tracker/wide-scan/spk/"))] | length == 64' \
+  '64-address descriptor registration did not create 64 watches'
+scan_after="$(ln_cli bwatch-status)"
+scan_completed_before="$(jq -er '.rescans_completed_total' <<<"$scan_before")"
+scan_blocks_before="$(jq -er '.rescan_blocks_processed_total' <<<"$scan_before")"
+assert_jq "$scan_after" \
+  ".rescans_completed_total == ($scan_completed_before + 1) and .rescan_blocks_processed_total == ($scan_blocks_before + $scan_tip - $scan_birth + 1)" \
+  '64-address descriptor registration did not use exactly one historical block pass'
+ln_cli tracker-unregister name=wide-scan >/dev/null
 
 # Checksums are enforced at the RPC boundary.
 descriptor_without_checksum="${descriptor%#*}"
@@ -370,7 +421,8 @@ assert_jq "$(ln_cli tracker-inspect name=deep-reorg)" '.incident == null' \
   'tracker-ack-incident did not clear the deep-reorg incident'
 ln_cli tracker-unregister name=deep-reorg >/dev/null
 
-assert_jq "$(ln_cli tracker-health)" '.healthy == true and .descriptors.active == 0' \
-  'tracker was unhealthy after lifecycle tests'
+wait_for_jq '.healthy == true and .descriptors.active == 0' \
+  'tracker was unhealthy after lifecycle tests' \
+  ln_cli tracker-health >/dev/null
 
 printf 'tracker lifecycle integration tests passed\n'
