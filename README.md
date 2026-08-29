@@ -194,7 +194,7 @@ unfinished movements remain persisted in CLN's datastore.
 
 The Rust unit suite covers descriptor validation, migration defaults, owner
 encoding, range growth, and confirmation maturity. Tracker's flake pins commit
-`614a6340df479482c8690e4d24bbea8647178fc5` from the
+`c902a7d4a11204fd78b754339f091a2c67f7715f` from the
 [`bwatch-plugin-block-events`](https://github.com/niftynei/lightning/tree/bwatch-plugin-block-events)
 CLN branch. Its integration package deliberately builds only the CLN programs
 and plugins needed for regtest, avoiding unrelated manual and Rust-plugin build

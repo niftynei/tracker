@@ -3,17 +3,17 @@
     "cln-bwatch": {
       "flake": false,
       "locked": {
-        "lastModified": 1787684392,
-        "narHash": "sha256-2W9qUS5rKrGA/CYt325xKK42VlTMM3CLxNrw5odK3J0=",
+        "lastModified": 1787787530,
+        "narHash": "sha256-Iiz4SRXL4iWMmntHQsgvbpS+D4BP89eCo6bi4Km0tM4=",
         "owner": "niftynei",
         "repo": "lightning",
-        "rev": "614a6340df479482c8690e4d24bbea8647178fc5",
+        "rev": "c902a7d4a11204fd78b754339f091a2c67f7715f",
         "type": "github"
       },
       "original": {
         "owner": "niftynei",
         "repo": "lightning",
-        "rev": "614a6340df479482c8690e4d24bbea8647178fc5",
+        "rev": "c902a7d4a11204fd78b754339f091a2c67f7715f",
         "type": "github"
       }
     },

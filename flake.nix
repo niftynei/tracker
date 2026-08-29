@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     cln-bwatch = {
-      url = "github:niftynei/lightning/614a6340df479482c8690e4d24bbea8647178fc5";
+      url = "github:niftynei/lightning/c902a7d4a11204fd78b754339f091a2c67f7715f";
       flake = false;
     };
     cln-gheap = {
@@ -150,7 +150,7 @@
               rustc
               rustfmt
             ];
-            CLN_BWATCH_COMMIT = "614a6340df479482c8690e4d24bbea8647178fc5";
+            CLN_BWATCH_COMMIT = "c902a7d4a11204fd78b754339f091a2c67f7715f";
             CLN_BWATCH_SOURCE = p.cln-source;
           };
         });
