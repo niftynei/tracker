@@ -4,9 +4,9 @@ use crate::model::{
     TrackedUtxo, WatchOwner, outpoint_owner, parse_owner, script_owner,
 };
 use crate::tracker::{
-    AppState, current_bwatch_height, deliver_and_store, desired_range_end, drain_pending_movements,
-    ensure_no_script_overlap, record_reorg, report_descriptor_failure, report_descriptor_success,
-    validate_config,
+    AppState, current_bwatch_height, deliver_and_store, desired_branch_range_end,
+    drain_pending_movements, ensure_no_script_overlap, record_reorg, report_descriptor_failure,
+    report_descriptor_success, validate_config,
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use cln_plugin::Plugin;
@@ -149,7 +149,11 @@ async fn handle_deposit(
         if event.historical_scan {
             MAX_LOOKAHEAD
         } else {
-            original.range_end
+            original
+                .range_ends
+                .get(&branch)
+                .copied()
+                .unwrap_or(original.range_end)
         },
     )?;
     let descriptor = validate_config(&original.config, &plugin.state().network)?;
@@ -177,17 +181,27 @@ async fn handle_deposit(
     let mut updated = original;
     let mut added_scripts = Vec::new();
     if updated
-        .last_used_index
+        .last_used_indexes
+        .get(&branch)
+        .copied()
         .is_none_or(|last| derivation_index > last)
     {
-        let new_end = desired_range_end(Some(derivation_index), updated.config.lookahead)?;
-        let old_end = updated.range_end;
-        added_scripts = descriptor.derive_range(old_end, new_end)?;
+        updated.last_used_indexes.insert(branch, derivation_index);
+        let new_end = desired_branch_range_end(&updated, branch, updated.config.lookahead)?
+            .max(updated.range_ends.get(&branch).copied().unwrap_or(0));
+        let old_end = updated.range_ends.get(&branch).copied().unwrap_or(0);
+        added_scripts = descriptor.derive_branch_range(branch, old_end, new_end)?;
         ensure_no_script_overlap(&name, &added_scripts, &records, &plugin.state().network)?;
-        updated.last_used_index = Some(derivation_index);
-        updated.range_end = new_end;
+        updated.range_ends.insert(branch, new_end);
+        updated.range_end = updated.range_ends.values().copied().max().unwrap_or(0);
+        updated.last_used_index = updated.last_used_indexes.values().copied().max();
         updated.status = DescriptorStatus::Syncing;
     }
+    let annotation = plugin
+        .state()
+        .issued_address(&name, branch, derivation_index)
+        .await
+        .and_then(|issued| issued.annotation);
     updated.utxos.insert(
         outpoint.clone(),
         TrackedUtxo {
@@ -196,6 +210,7 @@ async fn handle_deposit(
             derivation_index,
             branch,
             deposit_height: event.blockheight,
+            annotation: annotation.clone(),
             spent_by: None,
             spent_height: None,
         },
@@ -210,6 +225,7 @@ async fn handle_deposit(
             blockheight: event.blockheight,
             timestamp,
             spending_txid: None,
+            description: annotation,
         },
     );
     cln::save_record(&plugin.state().rpc_path, &mut updated)
@@ -342,6 +358,7 @@ async fn handle_spend(
             blockheight: event.blockheight,
             timestamp,
             spending_txid: Some(spending_txid),
+            description: None,
         },
     );
     cln::save_record(&plugin.state().rpc_path, &mut updated)
@@ -465,11 +482,15 @@ async fn revert_at_height(plugin: Plugin<AppState>, name: String, blockheight: u
         return Ok(());
     }
     if removed_deposit {
-        updated.last_used_index = updated
-            .utxos
-            .values()
-            .map(|utxo| utxo.derivation_index)
-            .max();
+        updated.last_used_indexes.clear();
+        for utxo in updated.utxos.values() {
+            updated
+                .last_used_indexes
+                .entry(utxo.branch)
+                .and_modify(|index| *index = (*index).max(utxo.derivation_index))
+                .or_insert(utxo.derivation_index);
+        }
+        updated.last_used_index = updated.last_used_indexes.values().copied().max();
     }
     cln::save_record(&plugin.state().rpc_path, &mut updated)
         .await
@@ -497,7 +518,7 @@ mod tests {
     #[test]
     fn expanded_frontier_accepts_indexes_beyond_the_gap_size() {
         let lookahead = 20;
-        let range_end = desired_range_end(Some(19), lookahead).unwrap();
+        let range_end = crate::tracker::desired_range_end(Some(19), lookahead).unwrap();
         assert_eq!(range_end, 40);
         assert!(ensure_derivation_index_is_watched(30, range_end).is_ok());
         assert!(ensure_derivation_index_is_watched(range_end, range_end).is_err());

@@ -1,4 +1,7 @@
-use crate::model::{BwatchScanResult, DescriptorRecord, STORE_DESCRIPTORS, STORE_PREFIX};
+use crate::model::{
+    BwatchScanResult, DescriptorRecord, IssuedAddress, STORE_ADDRESSES, STORE_DESCRIPTORS,
+    STORE_PREFIX,
+};
 use anyhow::{Context, Result, anyhow};
 use cln_rpc::ClnRpc;
 use miniscript::bitcoin::{Block, Transaction, consensus};
@@ -290,6 +293,33 @@ pub async fn inject_utxo_deposit(
     Ok(())
 }
 
+pub async fn describe_utxo(path: &Path, outpoint: &str, description: &str) -> Result<()> {
+    call(
+        path,
+        "bkpr-editdescriptionbyoutpoint",
+        json!({
+            "outpoint": outpoint,
+            "description": description,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn bookkeeper_account_events(path: &Path, account: &str) -> Result<Vec<Value>> {
+    let response = call(
+        path,
+        "bkpr-listaccountevents",
+        json!({ "account": account }),
+    )
+    .await?;
+    response
+        .get("events")
+        .and_then(Value::as_array)
+        .cloned()
+        .context("bkpr-listaccountevents response omitted events")
+}
+
 pub async fn inject_utxo_spend(
     path: &Path,
     account: &str,
@@ -364,6 +394,108 @@ pub async fn load_records(path: &Path) -> Result<Vec<DescriptorRecord>> {
         records.push(record);
     }
     Ok(records)
+}
+
+pub async fn load_issued_addresses(path: &Path) -> Result<Vec<IssuedAddress>> {
+    // listdatastore returns only the immediate children of a key. Address
+    // records deliberately use a hierarchy so a descriptor's namespace is
+    // inspectable, therefore walk name -> branch -> index to reach each leaf.
+    let names = list_datastore_children(path, &[STORE_PREFIX, STORE_ADDRESSES]).await?;
+    let mut entries = Vec::new();
+    for name_entry in names.datastore {
+        if name_entry.key.len() != 3 {
+            continue;
+        }
+        let name = name_entry.key[2].as_str();
+        let branches = list_datastore_children(path, &[STORE_PREFIX, STORE_ADDRESSES, name])
+            .await
+            .with_context(|| format!("listing address branches for '{name}'"))?;
+        for branch_entry in branches.datastore {
+            if branch_entry.key.len() != 4 {
+                continue;
+            }
+            let branch = branch_entry.key[3].as_str();
+            entries.extend(
+                list_datastore_children(path, &[STORE_PREFIX, STORE_ADDRESSES, name, branch])
+                    .await
+                    .with_context(|| {
+                        format!("listing address indexes for '{name}' branch {branch}")
+                    })?
+                    .datastore,
+            );
+        }
+    }
+
+    let mut addresses = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.key.len() != 5 || entry.key[0] != STORE_PREFIX || entry.key[1] != STORE_ADDRESSES {
+            continue;
+        }
+        let data = entry
+            .string
+            .with_context(|| format!("tracker address entry {:?} is not UTF-8", entry.key))?;
+        let mut address: IssuedAddress = serde_json::from_str(&data)
+            .with_context(|| format!("decoding tracker address entry {:?}", entry.key))?;
+        anyhow::ensure!(
+            address.name == entry.key[2]
+                && address.branch.to_string() == entry.key[3]
+                && address.index.to_string() == entry.key[4],
+            "tracker address datastore key does not match its value"
+        );
+        address.generation = entry.generation;
+        addresses.push(address);
+    }
+    Ok(addresses)
+}
+
+async fn list_datastore_children(path: &Path, key: &[&str]) -> Result<ListDatastoreResponse> {
+    serde_json::from_value(call(path, "listdatastore", json!({ "key": key })).await?)
+        .context("decoding listdatastore response")
+}
+
+pub async fn save_issued_address(path: &Path, address: &mut IssuedAddress) -> Result<()> {
+    let data = serde_json::to_string(address).context("serializing issued address")?;
+    let mut params = json!({
+        "key": [
+            STORE_PREFIX,
+            STORE_ADDRESSES,
+            address.name,
+            address.branch.to_string(),
+            address.index.to_string(),
+        ],
+        "string": data,
+    });
+    if let Some(generation) = address.generation {
+        params["mode"] = json!("must-replace");
+        params["generation"] = json!(generation);
+    } else {
+        params["mode"] = json!("must-create");
+    }
+    let response: DatastoreResponse =
+        serde_json::from_value(call(path, "datastore", params).await?)
+            .context("decoding issued-address datastore response")?;
+    address.generation = Some(response.generation);
+    Ok(())
+}
+
+pub async fn delete_issued_addresses(path: &Path, name: &str) -> Result<()> {
+    let addresses = load_issued_addresses(path).await?;
+    for address in addresses.into_iter().filter(|address| address.name == name) {
+        let mut params = json!({
+            "key": [
+                STORE_PREFIX,
+                STORE_ADDRESSES,
+                address.name,
+                address.branch.to_string(),
+                address.index.to_string(),
+            ],
+        });
+        if let Some(generation) = address.generation {
+            params["generation"] = json!(generation);
+        }
+        call(path, "deldatastore", params).await?;
+    }
+    Ok(())
 }
 
 pub async fn save_record(path: &Path, record: &mut DescriptorRecord) -> Result<()> {

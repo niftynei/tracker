@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
-use miniscript::bitcoin::NetworkKind;
 use miniscript::bitcoin::secp256k1::Secp256k1;
+use miniscript::bitcoin::{Address, Network, NetworkKind};
 use miniscript::descriptor::{Descriptor, DescriptorPublicKey, XKeyNetwork, checksum};
 use std::str::FromStr;
 
@@ -86,6 +86,39 @@ impl DescriptorSet {
         Ok(scripts)
     }
 
+    pub fn derive_branch_range(
+        &self,
+        branch: u32,
+        start: u32,
+        end: u32,
+    ) -> Result<Vec<DerivedScript>> {
+        ensure!(start <= end, "invalid derivation range {start}..{end}");
+        let descriptor = self
+            .branches
+            .get(usize::try_from(branch).context("invalid descriptor branch")?)
+            .with_context(|| format!("descriptor branch {branch} does not exist"))?;
+        if !self.ranged {
+            ensure!(
+                start == 0 && end <= 1,
+                "non-ranged descriptors have one script"
+            );
+        }
+        let secp = Secp256k1::verification_only();
+        let mut scripts = Vec::with_capacity(usize::try_from(end - start).unwrap_or(0));
+        for index in start..end {
+            let concrete = descriptor
+                .at_derivation_index(index)
+                .with_context(|| format!("unable to derive branch {branch} index {index}"))?
+                .derived_descriptor(&secp);
+            scripts.push(DerivedScript {
+                branch,
+                index,
+                scriptpubkey: hex::encode(concrete.script_pubkey().as_bytes()),
+            });
+        }
+        Ok(scripts)
+    }
+
     pub fn derive_one(&self, branch: u32, index: u32) -> Result<DerivedScript> {
         let descriptor = self
             .branches
@@ -104,6 +137,24 @@ impl DescriptorSet {
             index,
             scriptpubkey: hex::encode(concrete.script_pubkey().as_bytes()),
         })
+    }
+
+    pub fn derive_address(&self, branch: u32, index: u32, network: &str) -> Result<String> {
+        let derived = self.derive_one(branch, index)?;
+        let script = miniscript::bitcoin::ScriptBuf::from_bytes(
+            hex::decode(&derived.scriptpubkey).context("decoding derived scriptPubKey")?,
+        );
+        let network = match network {
+            "bitcoin" => Network::Bitcoin,
+            "testnet" => Network::Testnet,
+            "testnet4" => Network::Testnet4,
+            "signet" => Network::Signet,
+            "regtest" => Network::Regtest,
+            other => bail!("unsupported CLN network '{other}'"),
+        };
+        Address::from_script(&script, network)
+            .map(|address| address.to_string())
+            .context("descriptor script does not have a standard Bitcoin address")
     }
 }
 
@@ -166,5 +217,19 @@ mod tests {
         let set = DescriptorSet::parse_checked(&descriptor, "bitcoin").unwrap();
         assert!(set.is_ranged());
         assert_eq!(set.derive_range(0, 3).unwrap().len(), 3);
+        assert!(
+            set.derive_address(0, 0, "bitcoin")
+                .unwrap()
+                .starts_with("bc1p")
+        );
+    }
+
+    #[test]
+    fn expands_multipath_descriptor_into_independent_branches() {
+        let body = "pkh([6c3982ff/44h/1h/0h]tpubDDhG6JB3eeA5n5NJREikvriBiajXBp9kzFUUH9rMvCrytttLLQ1Qu7siqS7Y9nomDQLBxA6rNCiw1jTs9niBUEFie4gYtVUQ4wLMhgrDTgu/<0;1>/*)";
+        let descriptor = with_checksum(body);
+        let set = DescriptorSet::parse_checked(&descriptor, "regtest").unwrap();
+        assert_eq!(set.branch_count(), 2);
+        assert_eq!(set.derive_range(0, 3).unwrap().len(), 6);
     }
 }

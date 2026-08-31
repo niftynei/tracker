@@ -3,11 +3,13 @@ use std::collections::BTreeMap;
 
 pub const STORE_PREFIX: &str = "tracker";
 pub const STORE_DESCRIPTORS: &str = "descriptors";
+pub const STORE_ADDRESSES: &str = "addresses";
 pub const OWNER_PREFIX: &str = "plugin/tracker";
 pub const DEFAULT_LOOKAHEAD: u32 = 20;
 pub const DEFAULT_CONFIRMATIONS: u32 = 1;
 pub const MAX_LOOKAHEAD: u32 = 100_000;
 pub const MAX_CONFIRMATIONS: u32 = 2_016;
+pub const MAX_ANNOTATION_BYTES: usize = 1_024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DescriptorConfig {
@@ -36,6 +38,8 @@ pub struct PendingMovement {
     pub timestamp: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spending_txid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -46,9 +50,25 @@ pub struct TrackedUtxo {
     pub branch: u32,
     pub deposit_height: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spent_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spent_height: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct IssuedAddress {
+    pub name: String,
+    pub branch: u32,
+    pub index: u32,
+    pub address: String,
+    pub scriptpubkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<String>,
+    pub issued_at: u64,
+    #[serde(skip)]
+    pub generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -60,6 +80,12 @@ pub struct DescriptorRecord {
     #[serde(default)]
     pub pending_movements: BTreeMap<String, PendingMovement>,
     #[serde(default)]
+    pub next_indexes: BTreeMap<u32, u32>,
+    #[serde(default)]
+    pub range_ends: BTreeMap<u32, u32>,
+    #[serde(default)]
+    pub last_used_indexes: BTreeMap<u32, u32>,
+    #[serde(default)]
     pub range_end: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_index: Option<u32>,
@@ -69,6 +95,8 @@ pub struct DescriptorRecord {
     pub initial_scan_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_rescan: Option<PendingRescan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incident: Option<TrackerIncident>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -129,6 +157,39 @@ fn default_true() -> bool {
 #[derive(Clone, Debug, Deserialize)]
 pub struct NameRequest {
     pub name: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct NewAddressRequest {
+    pub name: String,
+    #[serde(default)]
+    pub branch: u32,
+    #[serde(default)]
+    pub annotation: Option<String>,
+    #[serde(default)]
+    pub minimum_index: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ListAddressesRequest {
+    pub name: String,
+    #[serde(default)]
+    pub branch: u32,
+    #[serde(default)]
+    pub start: Option<u32>,
+    #[serde(default = "default_address_page_limit")]
+    pub limit: u32,
+}
+
+fn default_address_page_limit() -> u32 {
+    100
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SyncDescriptionsRequest {
+    pub name: String,
+    #[serde(default)]
+    pub overwrite: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -308,6 +369,10 @@ mod tests {
         assert!(record.initial_scan_complete);
         assert_eq!(record.config.confirmations, DEFAULT_CONFIRMATIONS);
         assert!(record.pending_movements.is_empty());
+        assert!(record.next_indexes.is_empty());
+        assert!(record.range_ends.is_empty());
+        assert!(record.last_used_indexes.is_empty());
         assert!(record.pending_rescan.is_none());
+        assert!(record.scan_operation_id.is_none());
     }
 }

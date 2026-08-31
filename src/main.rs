@@ -6,8 +6,8 @@ mod tracker;
 
 use crate::events::{on_bwatch_block_processed, on_bwatch_block_reverted, on_bwatch_match};
 use crate::tracker::{
-    AppState, ack_incident, health, inspect, list, load, metrics, reconcile, register, rescan,
-    restore_watches, unregister, update,
+    AppState, ack_incident, health, inspect, list, list_addresses, load, metrics, new_address,
+    reconcile, register, rescan, restore_watches, sync_descriptions, unregister, update,
 };
 use anyhow::{Context, Result};
 use cln_plugin::{Builder, RpcMethodBuilder};
@@ -20,6 +20,21 @@ async fn main() -> Result<()> {
             RpcMethodBuilder::new_with_context("tracker-register", register)
                 .description("Register a checksummed output descriptor with bwatch")
                 .usage("name descriptor birthheight [lookahead] [confirmations]"),
+        )
+        .rpcmethod_from_builder(
+            RpcMethodBuilder::new("tracker-newaddr", new_address)
+                .description("Allocate and watch the next address from a registered descriptor")
+                .usage("name [branch] [annotation] [minimum_index]"),
+        )
+        .rpcmethod_from_builder(
+            RpcMethodBuilder::new("tracker-listaddresses", list_addresses)
+                .description("List issued descriptor addresses with bounded pagination")
+                .usage("name [branch] [start] [limit]"),
+        )
+        .rpcmethod_from_builder(
+            RpcMethodBuilder::new("tracker-sync-descriptions", sync_descriptions)
+                .description("Reconcile annotated Tracker UTXOs with Bookkeeper descriptions")
+                .usage("name [overwrite]"),
         )
         .rpcmethod_from_builder(
             RpcMethodBuilder::new("tracker-unregister", unregister)

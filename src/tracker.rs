@@ -1,10 +1,11 @@
 use crate::cln;
 use crate::descriptor::DescriptorSet;
 use crate::model::{
-    DescriptorConfig, DescriptorRecord, DescriptorStatus, MAX_LOOKAHEAD, MovementKind, NameRequest,
-    OWNER_PREFIX, PendingRescan, ReconcileRequest, RegisterRequest, RescanRequest, TrackerIncident,
-    UpdateRequest, outpoint_owner, script_owner, validate_confirmations, validate_lookahead,
-    validate_name,
+    DescriptorConfig, DescriptorRecord, DescriptorStatus, IssuedAddress, ListAddressesRequest,
+    MAX_ANNOTATION_BYTES, MAX_LOOKAHEAD, MovementKind, NameRequest, NewAddressRequest,
+    OWNER_PREFIX, PendingRescan, ReconcileRequest, RegisterRequest, RescanRequest,
+    SyncDescriptionsRequest, TrackerIncident, UpdateRequest, outpoint_owner, script_owner,
+    validate_confirmations, validate_lookahead, validate_name,
 };
 use anyhow::{Context, Error, Result, ensure};
 use cln_plugin::{Plugin, RequestContext};
@@ -12,22 +13,50 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::MissedTickBehavior;
+
+static SCAN_OPERATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub struct AppState {
     pub inner: Arc<Mutex<TrackerState>>,
     operations: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
+    active_scans: Arc<StdMutex<BTreeMap<String, String>>>,
     pub rpc_path: PathBuf,
     pub network: String,
+}
+
+pub struct ActiveScanGuard {
+    active_scans: Arc<StdMutex<BTreeMap<String, String>>>,
+    name: String,
+    operation_id: String,
+}
+
+impl ActiveScanGuard {
+    fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+}
+
+impl Drop for ActiveScanGuard {
+    fn drop(&mut self) {
+        let Ok(mut active_scans) = self.active_scans.lock() else {
+            return;
+        };
+        if active_scans.get(&self.name) == Some(&self.operation_id) {
+            active_scans.remove(&self.name);
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct TrackerState {
     pub records: BTreeMap<String, DescriptorRecord>,
+    pub issued_addresses: BTreeMap<String, BTreeMap<(u32, u32), IssuedAddress>>,
     pub reconciliation_failures: u64,
     pub bookkeeper_failures: u64,
     pub reorgs: u64,
@@ -38,6 +67,7 @@ impl AppState {
         Self {
             inner: Arc::new(Mutex::new(TrackerState::default())),
             operations: Arc::new(Mutex::new(BTreeMap::new())),
+            active_scans: Arc::new(StdMutex::new(BTreeMap::new())),
             rpc_path,
             network,
         }
@@ -67,7 +97,9 @@ impl AppState {
     }
 
     pub async fn remove_record(&self, name: &str) {
-        self.inner.lock().await.records.remove(name);
+        let mut tracker = self.inner.lock().await;
+        tracker.records.remove(name);
+        tracker.issued_addresses.remove(name);
     }
 
     pub async fn records_snapshot(&self) -> BTreeMap<String, DescriptorRecord> {
@@ -76,6 +108,79 @@ impl AppState {
 
     pub async fn record_names(&self) -> Vec<String> {
         self.inner.lock().await.records.keys().cloned().collect()
+    }
+
+    pub async fn issued_address(
+        &self,
+        name: &str,
+        branch: u32,
+        index: u32,
+    ) -> Option<IssuedAddress> {
+        self.inner
+            .lock()
+            .await
+            .issued_addresses
+            .get(name)
+            .and_then(|addresses| addresses.get(&(branch, index)))
+            .cloned()
+    }
+
+    pub async fn issued_addresses(&self, name: &str) -> Vec<IssuedAddress> {
+        self.inner
+            .lock()
+            .await
+            .issued_addresses
+            .get(name)
+            .map(|addresses| addresses.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub async fn put_issued_address(&self, address: IssuedAddress) {
+        self.inner
+            .lock()
+            .await
+            .issued_addresses
+            .entry(address.name.clone())
+            .or_default()
+            .insert((address.branch, address.index), address);
+    }
+
+    pub fn begin_scan(&self, name: &str) -> Result<ActiveScanGuard> {
+        let mut active_scans = self
+            .active_scans
+            .lock()
+            .map_err(|_| anyhow::anyhow!("tracker active scan lock is poisoned"))?;
+        ensure!(
+            !active_scans.contains_key(name),
+            "descriptor '{name}' already has an active scan"
+        );
+        let operation_id = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            SCAN_OPERATION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        active_scans.insert(name.to_owned(), operation_id.clone());
+        Ok(ActiveScanGuard {
+            active_scans: Arc::clone(&self.active_scans),
+            name: name.to_owned(),
+            operation_id,
+        })
+    }
+
+    pub fn ensure_no_active_scan(&self, name: &str) -> Result<()> {
+        let active_scans = self
+            .active_scans
+            .lock()
+            .map_err(|_| anyhow::anyhow!("tracker active scan lock is poisoned"))?;
+        ensure!(
+            !active_scans.contains_key(name),
+            "descriptor '{name}' has an active scan"
+        );
+        Ok(())
     }
 }
 
@@ -283,6 +388,29 @@ pub fn desired_range_end(last_used: Option<u32>, lookahead: u32) -> Result<u32> 
     Ok(end)
 }
 
+pub fn branch_frontier(record: &DescriptorRecord, branch: u32) -> Option<u32> {
+    let last_used = record.last_used_indexes.get(&branch).copied();
+    let last_issued = record
+        .next_indexes
+        .get(&branch)
+        .copied()
+        .and_then(|next| next.checked_sub(1));
+    last_used.max(last_issued)
+}
+
+pub fn desired_branch_range_end(
+    record: &DescriptorRecord,
+    branch: u32,
+    lookahead: u32,
+) -> Result<u32> {
+    desired_range_end(branch_frontier(record, branch), lookahead)
+}
+
+fn refresh_aggregate_indexes(record: &mut DescriptorRecord) {
+    record.range_end = record.range_ends.values().copied().max().unwrap_or(0);
+    record.last_used_index = record.last_used_indexes.values().copied().max();
+}
+
 pub fn movement_is_mature(blockheight: u32, confirmations: u32, tip_height: u32) -> bool {
     blockheight
         .checked_add(confirmations.saturating_sub(1))
@@ -325,6 +453,11 @@ pub async fn deliver_mature_movements(
                 )
                 .await
                 .context("injecting durable Bookkeeper deposit")?;
+                if let Some(description) = movement.description.as_deref() {
+                    cln::describe_utxo(&state.rpc_path, &movement.outpoint, description)
+                        .await
+                        .context("describing durable Bookkeeper deposit")?;
+                }
             }
             MovementKind::Spend => {
                 let spending_txid = movement
@@ -381,23 +514,109 @@ pub async fn drain_pending_movements(state: &AppState, name: &str, tip_height: u
 
 pub async fn load(state: &AppState) -> Result<()> {
     let records = cln::load_records(&state.rpc_path).await?;
+    let addresses = cln::load_issued_addresses(&state.rpc_path).await?;
+    let mut issued_by_name = BTreeMap::<String, BTreeMap<(u32, u32), IssuedAddress>>::new();
+    for address in addresses {
+        issued_by_name
+            .entry(address.name.clone())
+            .or_default()
+            .insert((address.branch, address.index), address);
+    }
     let mut restored = BTreeMap::new();
     for mut record in records {
-        if record.range_end == 0 {
-            record.range_end = record.config.lookahead;
-        }
+        let original = record.clone();
         let descriptor = validate_config(&record.config, &state.network)
             .with_context(|| format!("validating stored descriptor '{}'", record.config.name))?;
-        let scripts = descriptor.derive_range(0, record.range_end)?;
+        let branch_count = u32::try_from(descriptor.branch_count()).context("too many branches")?;
+        if record.range_ends.is_empty() {
+            let migrated_end = if record.range_end == 0 {
+                record.config.lookahead
+            } else {
+                record.range_end
+            };
+            for branch in 0..branch_count {
+                record.range_ends.insert(branch, migrated_end);
+            }
+        }
+        if record.last_used_indexes.is_empty() {
+            for utxo in record.utxos.values() {
+                record
+                    .last_used_indexes
+                    .entry(utxo.branch)
+                    .and_modify(|index| *index = (*index).max(utxo.derivation_index))
+                    .or_insert(utxo.derivation_index);
+            }
+            if record.last_used_indexes.is_empty()
+                && let Some(legacy) = record.last_used_index
+            {
+                record.last_used_indexes.entry(0).or_insert(legacy);
+            }
+        }
+        let descriptor_addresses = issued_by_name
+            .get(&record.config.name)
+            .cloned()
+            .unwrap_or_default();
+        for address in descriptor_addresses.values() {
+            ensure!(
+                address.branch < branch_count,
+                "issued address for '{}' has invalid branch {}",
+                record.config.name,
+                address.branch
+            );
+            let derived = descriptor.derive_one(address.branch, address.index)?;
+            ensure!(
+                derived.scriptpubkey == address.scriptpubkey
+                    && descriptor.derive_address(address.branch, address.index, &state.network)?
+                        == address.address,
+                "issued address metadata does not match descriptor '{}'",
+                record.config.name
+            );
+            let next = address
+                .index
+                .checked_add(1)
+                .context("issued address cursor overflow")?;
+            record
+                .next_indexes
+                .entry(address.branch)
+                .and_modify(|current| *current = (*current).max(next))
+                .or_insert(next);
+        }
+        for branch in 0..branch_count {
+            let desired = desired_branch_range_end(&record, branch, record.config.lookahead)?;
+            record
+                .range_ends
+                .entry(branch)
+                .and_modify(|end| *end = (*end).max(desired))
+                .or_insert(desired);
+        }
+        refresh_aggregate_indexes(&mut record);
+        let scripts = descriptor_scripts(&record, &descriptor)?;
         ensure_no_script_overlap(&record.config.name, &scripts, &restored, &state.network)?;
         ensure!(
             !restored.contains_key(&record.config.name),
             "duplicate stored descriptor '{}'",
             record.config.name
         );
+        if record != original {
+            cln::save_record(&state.rpc_path, &mut record)
+                .await
+                .with_context(|| format!("migrating descriptor '{}'", record.config.name))?;
+        }
         restored.insert(record.config.name.clone(), record);
     }
-    state.inner.lock().await.records = restored;
+    for name in issued_by_name.keys() {
+        if !restored.contains_key(name) {
+            cln::delete_issued_addresses(&state.rpc_path, name)
+                .await
+                .with_context(|| format!("removing orphaned issued addresses for '{name}'"))?;
+        }
+    }
+    let mut tracker = state.inner.lock().await;
+    tracker.records = restored;
+    tracker.issued_addresses = issued_by_name
+        .into_iter()
+        .filter(|(name, _)| tracker.records.contains_key(name))
+        .collect();
     Ok(())
 }
 
@@ -418,7 +637,7 @@ fn expected_watches(
     descriptor: &DescriptorSet,
 ) -> Result<BTreeSet<cln::OwnedWatch>> {
     let mut expected = BTreeSet::new();
-    for script in descriptor.derive_range(0, record.range_end)? {
+    for script in descriptor_scripts(record, descriptor)? {
         expected.insert(cln::OwnedWatch::Script {
             owner: script_owner(&record.config.name, script.branch, script.index),
             scriptpubkey: script.scriptpubkey,
@@ -431,6 +650,22 @@ fn expected_watches(
         });
     }
     Ok(expected)
+}
+
+fn descriptor_scripts(
+    record: &DescriptorRecord,
+    descriptor: &DescriptorSet,
+) -> Result<Vec<crate::descriptor::DerivedScript>> {
+    let mut scripts = Vec::new();
+    for branch in 0..u32::try_from(descriptor.branch_count()).context("too many branches")? {
+        let range_end = record
+            .range_ends
+            .get(&branch)
+            .copied()
+            .unwrap_or(record.range_end);
+        scripts.extend(descriptor.derive_branch_range(branch, 0, range_end)?);
+    }
+    Ok(scripts)
 }
 
 async fn reconcile_watches(
@@ -555,7 +790,7 @@ pub(crate) fn ensure_no_script_overlap(
             continue;
         }
         let descriptor = validate_config(&record.config, network)?;
-        for script in descriptor.derive_range(0, record.range_end)? {
+        for script in descriptor_scripts(record, &descriptor)? {
             ensure!(
                 !candidate.contains(script.scriptpubkey.as_str()),
                 "descriptor script overlaps registered descriptor '{}'",
@@ -568,12 +803,14 @@ pub(crate) fn ensure_no_script_overlap(
 
 async fn reconcile_descriptor(state: &AppState, name: &str, tip_height: u32) -> Result<Value> {
     let _operation = state.lock_descriptor(name).await;
+    state.ensure_no_active_scan(name)?;
     let mut record = state
         .record(name)
         .await
         .with_context(|| format!("descriptor '{name}' is not registered"))?;
     if record.status == DescriptorStatus::Deleting {
         delete_owned_watches(state, name).await?;
+        cln::delete_issued_addresses(&state.rpc_path, name).await?;
         cln::delete_record(&state.rpc_path, &record).await?;
         state.remove_record(name).await;
         return Ok(json!({ "name": name, "removed": true }));
@@ -588,6 +825,7 @@ async fn reconcile_descriptor(state: &AppState, name: &str, tip_height: u32) -> 
     );
     reconcile_watches(state, &record, true).await?;
     record.status = DescriptorStatus::Active;
+    record.scan_operation_id = None;
     mark_success(&mut record, "startup_reconciliation");
     cln::save_record(&state.rpc_path, &mut record)
         .await
@@ -851,6 +1089,10 @@ pub async fn register(
     };
     let descriptor = validate_config(&config, &plugin.state().network)?;
     let scripts = descriptor.derive_range(0, config.lookahead)?;
+    let initial_range_ends = (0..u32::try_from(descriptor.branch_count())
+        .context("too many descriptor branches")?)
+        .map(|branch| (branch, config.lookahead))
+        .collect::<BTreeMap<_, _>>();
     let scan_end = if descriptor.is_ranged() {
         MAX_LOOKAHEAD
     } else {
@@ -879,10 +1121,13 @@ pub async fn register(
         );
         existing.clone()
     } else {
-        let mut record = DescriptorRecord {
+        DescriptorRecord {
             config,
             utxos: BTreeMap::new(),
             pending_movements: BTreeMap::new(),
+            next_indexes: BTreeMap::new(),
+            range_ends: initial_range_ends,
+            last_used_indexes: BTreeMap::new(),
             range_end: scripts
                 .iter()
                 .map(|script| script.index + 1)
@@ -892,16 +1137,18 @@ pub async fn register(
             status: DescriptorStatus::Syncing,
             initial_scan_complete: false,
             pending_rescan: None,
+            scan_operation_id: None,
             incident: None,
             last_success_at: None,
             generation: None,
-        };
-        cln::save_record(&plugin.state().rpc_path, &mut record)
-            .await
-            .context("persisting descriptor registration intent")?;
-        plugin.state().put_record(record.clone()).await;
-        record
+        }
     };
+    let scan_operation = plugin.state().begin_scan(&record.config.name)?;
+    record.scan_operation_id = Some(scan_operation.operation_id().to_owned());
+    cln::save_record(&plugin.state().rpc_path, &mut record)
+        .await
+        .context("persisting descriptor registration intent")?;
+    plugin.state().put_record(record.clone()).await;
 
     drop(operation);
 
@@ -957,6 +1204,10 @@ pub async fn register(
         .record(&record.config.name)
         .await
         .context("descriptor disappeared while applying historical scan")?;
+    ensure!(
+        record.scan_operation_id.as_deref() == Some(scan_operation.operation_id()),
+        "descriptor registration scan operation changed while its scan was running"
+    );
     if !record.initial_scan_complete {
         record.initial_scan_complete = true;
         cln::save_record(&plugin.state().rpc_path, &mut record)
@@ -981,6 +1232,7 @@ pub async fn register(
         return Err(error);
     }
     record.status = DescriptorStatus::Active;
+    record.scan_operation_id = None;
     mark_success(&mut record, "register");
     cln::save_record(&plugin.state().rpc_path, &mut record)
         .await
@@ -1055,31 +1307,37 @@ pub async fn rescan(
             "descriptor '{}' has another interrupted operation; reconcile it before rescanning",
             request.name
         );
-        let new_end = desired_range_end(old.last_used_index, requested_lookahead)?;
-        let desired_scripts = descriptor.derive_range(0, new_end)?;
+        let mut updated = old;
+        updated.config.lookahead = requested_lookahead;
+        for branch in
+            0..u32::try_from(descriptor.branch_count()).context("too many descriptor branches")?
+        {
+            let new_end = desired_branch_range_end(&updated, branch, requested_lookahead)?;
+            updated.range_ends.insert(branch, new_end);
+        }
+        refresh_aggregate_indexes(&mut updated);
+        let desired_scripts = descriptor_scripts(&updated, &descriptor)?;
         ensure_no_script_overlap(
-            &old.config.name,
+            &updated.config.name,
             &desired_scripts,
             &records,
             &plugin.state().network,
         )?;
-        let mut updated = old;
-        updated.config.lookahead = requested_lookahead;
-        updated.range_end = new_end;
         updated.status = DescriptorStatus::Syncing;
         updated.pending_rescan = Some(PendingRescan {
             start_block: requested_start,
         });
-        cln::save_record(&plugin.state().rpc_path, &mut updated)
-            .await
-            .context("persisting descriptor rescan intent")?;
-        plugin.state().put_record(updated.clone()).await;
         updated
     };
+    let scan_operation = plugin.state().begin_scan(&record.config.name)?;
+    record.scan_operation_id = Some(scan_operation.operation_id().to_owned());
+    cln::save_record(&plugin.state().rpc_path, &mut record)
+        .await
+        .context("persisting descriptor rescan intent")?;
+    plugin.state().put_record(record.clone()).await;
 
-    let scan_scripts = descriptor
-        .derive_range(0, record.range_end)
-        .context("deriving descriptor rescan range")?;
+    let scan_scripts =
+        descriptor_scripts(&record, &descriptor).context("deriving descriptor rescan range")?;
     let transient_watches = scan_scripts
         .into_iter()
         .map(|script| {
@@ -1130,6 +1388,10 @@ pub async fn rescan(
             .is_some_and(|pending| { pending.start_block == requested_start }),
         "descriptor rescan operation changed while its scan was running"
     );
+    ensure!(
+        record.scan_operation_id.as_deref() == Some(scan_operation.operation_id()),
+        "descriptor rescan identity changed while its scan was running"
+    );
     if let Err(error) = reconcile_watches(plugin.state(), &record, false)
         .await
         .context("installing descriptor watches after historical rescan")
@@ -1141,6 +1403,7 @@ pub async fn rescan(
         return Err(error);
     }
     record.pending_rescan = None;
+    record.scan_operation_id = None;
     record.status = DescriptorStatus::Active;
     mark_success(&mut record, "rescan");
     cln::save_record(&plugin.state().rpc_path, &mut record)
@@ -1163,6 +1426,7 @@ pub async fn rescan(
 pub async fn unregister(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
     let request: NameRequest = parse_request(args, &["name"])?;
     let _operation = plugin.state().lock_descriptor(&request.name).await;
+    plugin.state().ensure_no_active_scan(&request.name)?;
     let mut record = plugin
         .state()
         .record(&request.name)
@@ -1178,6 +1442,14 @@ pub async fn unregister(plugin: Plugin<AppState>, args: Value) -> Result<Value> 
     if let Err(error) = delete_owned_watches(plugin.state(), &request.name)
         .await
         .context("deleting descriptor watches")
+    {
+        drop(_operation);
+        report_descriptor_failure(plugin.state(), &request.name, "unregister", &error, false).await;
+        return Err(error);
+    }
+    if let Err(error) = cln::delete_issued_addresses(&plugin.state().rpc_path, &request.name)
+        .await
+        .context("deleting issued address metadata")
     {
         drop(_operation);
         report_descriptor_failure(plugin.state(), &request.name, "unregister", &error, false).await;
@@ -1204,6 +1476,264 @@ pub async fn inspect(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
         .with_context(|| format!("descriptor '{}' is not registered", request.name))?;
     let descriptor = validate_config(&record.config, &plugin.state().network)?;
     Ok(record_view(&record, &descriptor))
+}
+
+pub async fn new_address(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
+    let request: NewAddressRequest =
+        parse_request(args, &["name", "branch", "annotation", "minimum_index"])?;
+    if let Some(annotation) = request.annotation.as_deref() {
+        ensure!(!annotation.is_empty(), "annotation cannot be empty");
+        ensure!(
+            annotation.len() <= MAX_ANNOTATION_BYTES,
+            "annotation exceeds {MAX_ANNOTATION_BYTES} UTF-8 bytes"
+        );
+    }
+
+    let _operation = plugin.state().lock_descriptor(&request.name).await;
+    plugin.state().ensure_no_active_scan(&request.name)?;
+    let records = plugin.state().records_snapshot().await;
+    let mut record = records
+        .get(&request.name)
+        .cloned()
+        .with_context(|| format!("descriptor '{}' is not registered", request.name))?;
+    ensure!(
+        record.status == DescriptorStatus::Active && record.initial_scan_complete,
+        "descriptor '{}' is not ready to issue addresses",
+        request.name
+    );
+    let descriptor = validate_config(&record.config, &plugin.state().network)?;
+    ensure!(
+        descriptor.is_ranged(),
+        "non-ranged descriptors cannot issue new addresses"
+    );
+    ensure!(
+        usize::try_from(request.branch)
+            .ok()
+            .is_some_and(|branch| branch < descriptor.branch_count()),
+        "descriptor branch {} does not exist",
+        request.branch
+    );
+
+    let observed_next = record
+        .utxos
+        .values()
+        .filter(|utxo| utxo.branch == request.branch)
+        .map(|utxo| utxo.derivation_index.saturating_add(1))
+        .max()
+        .unwrap_or(0);
+    let issued_next = plugin
+        .state()
+        .issued_addresses(&request.name)
+        .await
+        .into_iter()
+        .filter(|issued| issued.branch == request.branch)
+        .map(|issued| issued.index.saturating_add(1))
+        .max()
+        .unwrap_or(0);
+    let next_index = record
+        .next_indexes
+        .get(&request.branch)
+        .copied()
+        .unwrap_or(0)
+        .max(observed_next)
+        .max(issued_next);
+    let index = next_index.max(request.minimum_index.unwrap_or(0));
+    ensure!(
+        index < (1 << 31) - 1,
+        "address index exceeds unhardened indexes"
+    );
+    let derived = descriptor.derive_one(request.branch, index)?;
+    let address = descriptor.derive_address(request.branch, index, &plugin.state().network)?;
+    let mut issued = IssuedAddress {
+        name: request.name.clone(),
+        branch: request.branch,
+        index,
+        address,
+        scriptpubkey: derived.scriptpubkey,
+        annotation: request.annotation,
+        issued_at: unix_time(),
+        generation: None,
+    };
+    cln::save_issued_address(&plugin.state().rpc_path, &mut issued)
+        .await
+        .context("persisting allocated address metadata")?;
+    plugin.state().put_issued_address(issued.clone()).await;
+    record.next_indexes.insert(request.branch, index + 1);
+    let branch_end = desired_branch_range_end(&record, request.branch, record.config.lookahead)?;
+    record.range_ends.insert(request.branch, branch_end);
+    refresh_aggregate_indexes(&mut record);
+    let desired_scripts = descriptor_scripts(&record, &descriptor)?;
+    ensure_no_script_overlap(
+        &record.config.name,
+        &desired_scripts,
+        &records,
+        &plugin.state().network,
+    )?;
+
+    record.status = DescriptorStatus::Syncing;
+    cln::save_record(&plugin.state().rpc_path, &mut record)
+        .await
+        .context("persisting allocated descriptor address")?;
+    plugin.state().put_record(record.clone()).await;
+    if let Err(error) = reconcile_watches(plugin.state(), &record, false)
+        .await
+        .context("installing watches for allocated descriptor address")
+    {
+        plugin.state().put_record(record).await;
+        drop(_operation);
+        report_descriptor_failure(plugin.state(), &request.name, "new_address", &error, false)
+            .await;
+        return Err(error);
+    }
+    record.status = DescriptorStatus::Active;
+    mark_success(&mut record, "new_address");
+    cln::save_record(&plugin.state().rpc_path, &mut record)
+        .await
+        .context("activating allocated descriptor address")?;
+    let response = json!({
+        "name": record.config.name,
+        "branch": issued.branch,
+        "index": issued.index,
+        "address": issued.address,
+        "scriptpubkey": issued.scriptpubkey,
+        "annotation": issued.annotation,
+        "next_index": record.next_indexes.get(&issued.branch),
+        "lookahead": record.config.lookahead,
+        "range_end": record.range_end,
+        "range_ends": record.range_ends,
+    });
+    plugin.state().put_record(record).await;
+    Ok(response)
+}
+
+pub async fn list_addresses(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
+    let request: ListAddressesRequest = parse_request(args, &["name", "branch", "start", "limit"])?;
+    ensure!(
+        (1..=1_000).contains(&request.limit),
+        "limit must be between 1 and 1000"
+    );
+    ensure!(
+        plugin.state().record(&request.name).await.is_some(),
+        "descriptor '{}' is not registered",
+        request.name
+    );
+    let mut addresses = plugin
+        .state()
+        .issued_addresses(&request.name)
+        .await
+        .into_iter()
+        .filter(|address| address.branch == request.branch)
+        .filter(|address| request.start.is_none_or(|start| address.index >= start))
+        .collect::<Vec<_>>();
+    addresses.sort_by_key(|address| (address.branch, address.index));
+    let has_more = addresses.len() > usize::try_from(request.limit).unwrap_or(usize::MAX);
+    addresses.truncate(usize::try_from(request.limit).unwrap_or(usize::MAX));
+    let next_start = has_more
+        .then(|| {
+            addresses
+                .last()
+                .map(|address| address.index.saturating_add(1))
+        })
+        .flatten();
+    Ok(json!({
+        "name": request.name,
+        "branch": request.branch,
+        "addresses": addresses,
+        "next_start": next_start,
+    }))
+}
+
+fn json_msat_is_nonzero(value: Option<&Value>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    value.as_u64().is_some_and(|amount| amount > 0)
+        || value
+            .as_str()
+            .and_then(|amount| amount.strip_suffix("msat"))
+            .and_then(|amount| amount.parse::<u64>().ok())
+            .is_some_and(|amount| amount > 0)
+        || value
+            .get("msat")
+            .and_then(Value::as_u64)
+            .is_some_and(|amount| amount > 0)
+}
+
+pub async fn sync_descriptions(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
+    let request: SyncDescriptionsRequest = parse_request(args, &["name", "overwrite"])?;
+    let _operation = plugin.state().lock_descriptor(&request.name).await;
+    plugin.state().ensure_no_active_scan(&request.name)?;
+    let record = plugin
+        .state()
+        .record(&request.name)
+        .await
+        .with_context(|| format!("descriptor '{}' is not registered", request.name))?;
+    ensure!(
+        record.status != DescriptorStatus::Deleting,
+        "descriptor '{}' is being deleted",
+        request.name
+    );
+    let events = cln::bookkeeper_account_events(&plugin.state().rpc_path, &request.name)
+        .await
+        .context("listing Bookkeeper events before description sync")?;
+    let descriptions = events
+        .iter()
+        .filter(|event| json_msat_is_nonzero(event.get("credit_msat")))
+        .filter_map(|event| {
+            event
+                .get("outpoint")
+                .and_then(Value::as_str)
+                .map(|outpoint| {
+                    (
+                        outpoint.to_owned(),
+                        event
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    )
+                })
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut synced = Vec::new();
+    let mut unchanged = Vec::new();
+    let mut conflicts = Vec::new();
+    let mut missing_events = Vec::new();
+    for utxo in record.utxos.values() {
+        let Some(annotation) = utxo.annotation.as_deref() else {
+            continue;
+        };
+        let Some(current) = descriptions.get(&utxo.outpoint) else {
+            missing_events.push(utxo.outpoint.clone());
+            continue;
+        };
+        if current.as_deref() == Some(annotation) {
+            unchanged.push(utxo.outpoint.clone());
+            continue;
+        }
+        if current.is_some() && !request.overwrite {
+            conflicts.push(json!({
+                "outpoint": utxo.outpoint,
+                "tracker_annotation": annotation,
+                "bookkeeper_description": current,
+            }));
+            continue;
+        }
+        cln::describe_utxo(&plugin.state().rpc_path, &utxo.outpoint, annotation)
+            .await
+            .with_context(|| format!("syncing Bookkeeper description for {}", utxo.outpoint))?;
+        synced.push(utxo.outpoint.clone());
+    }
+
+    Ok(json!({
+        "name": request.name,
+        "overwrite": request.overwrite,
+        "annotated_utxos": record.utxos.values().filter(|utxo| utxo.annotation.is_some()).count(),
+        "synced": synced,
+        "unchanged": unchanged,
+        "conflicts": conflicts,
+        "missing_events": missing_events,
+    }))
 }
 
 pub async fn list(plugin: Plugin<AppState>, _args: Value) -> Result<Value> {
@@ -1233,6 +1763,7 @@ pub async fn update(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
         validate_confirmations(confirmations)?;
     }
     let _operation = plugin.state().lock_descriptor(&request.name).await;
+    plugin.state().ensure_no_active_scan(&request.name)?;
     let records = plugin.state().records_snapshot().await;
     let old = records
         .get(&request.name)
@@ -1301,18 +1832,23 @@ pub async fn update(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
         return Ok(record_view(&old, &descriptor));
     }
 
-    let new_end = desired_range_end(old.last_used_index, requested_lookahead)?;
-    let desired_scripts = descriptor.derive_range(0, new_end)?;
+    let mut updated = old.clone();
+    updated.config.lookahead = requested_lookahead;
+    updated.config.confirmations = requested_confirmations;
+    for branch in
+        0..u32::try_from(descriptor.branch_count()).context("too many descriptor branches")?
+    {
+        let new_end = desired_branch_range_end(&updated, branch, requested_lookahead)?;
+        updated.range_ends.insert(branch, new_end);
+    }
+    refresh_aggregate_indexes(&mut updated);
+    let desired_scripts = descriptor_scripts(&updated, &descriptor)?;
     ensure_no_script_overlap(
-        &old.config.name,
+        &updated.config.name,
         &desired_scripts,
         &records,
         &plugin.state().network,
     )?;
-    let mut updated = old.clone();
-    updated.config.lookahead = requested_lookahead;
-    updated.config.confirmations = requested_confirmations;
-    updated.range_end = new_end;
     updated.status = DescriptorStatus::Syncing;
     cln::save_record(&plugin.state().rpc_path, &mut updated)
         .await
@@ -1624,10 +2160,15 @@ pub fn record_view(record: &DescriptorRecord, descriptor: &DescriptorSet) -> Val
         "range_end": record.range_end,
         "last_used_index": record.last_used_index,
         "status": record.status,
+        "initial_scan_complete": record.initial_scan_complete,
         "pending_rescan": record.pending_rescan,
+        "scan_operation_id": record.scan_operation_id,
         "incident": record.incident,
         "last_success_at": record.last_success_at,
         "branches": descriptor.branch_count(),
+        "next_indexes": record.next_indexes,
+        "range_ends": record.range_ends,
+        "last_used_indexes": record.last_used_indexes,
         "tracked_utxos": record.utxos.values().collect::<Vec<_>>(),
         "pending_movements": record.pending_movements.values().collect::<Vec<_>>(),
     })
@@ -1706,6 +2247,22 @@ mod tests {
         assert_eq!(rpc_progress(101, 100), Some((99, 100)));
         assert_eq!(rpc_progress(1, 1), None);
         assert_eq!(rpc_progress(1, u64::from(u32::MAX) + 1), None);
+    }
+
+    #[test]
+    fn active_scans_are_single_flight_and_release_on_drop() {
+        let state = AppState::new(PathBuf::from("/tmp/lightning-rpc"), "regtest".to_owned());
+        let first = state.begin_scan("treasury").unwrap();
+        let first_id = first.operation_id().to_owned();
+
+        assert!(state.ensure_no_active_scan("treasury").is_err());
+        assert!(state.begin_scan("treasury").is_err());
+        assert!(state.begin_scan("savings").is_ok());
+
+        drop(first);
+        state.ensure_no_active_scan("treasury").unwrap();
+        let replacement = state.begin_scan("treasury").unwrap();
+        assert_ne!(replacement.operation_id(), first_id);
     }
 
     #[test]
@@ -1817,11 +2374,15 @@ mod tests {
                 config,
                 utxos: BTreeMap::new(),
                 pending_movements: BTreeMap::new(),
+                next_indexes: BTreeMap::new(),
+                range_ends: BTreeMap::from([(0, 1)]),
+                last_used_indexes: BTreeMap::new(),
                 range_end: 1,
                 last_used_index: None,
                 status: DescriptorStatus::Active,
                 initial_scan_complete: true,
                 pending_rescan: None,
+                scan_operation_id: None,
                 incident: None,
                 last_success_at: None,
                 generation: None,
