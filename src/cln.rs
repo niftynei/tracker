@@ -1,4 +1,4 @@
-use crate::model::{DescriptorRecord, STORE_DESCRIPTORS, STORE_PREFIX};
+use crate::model::{BwatchScanResult, DescriptorRecord, STORE_DESCRIPTORS, STORE_PREFIX};
 use anyhow::{Context, Result, anyhow};
 use cln_rpc::ClnRpc;
 use miniscript::bitcoin::{Block, Transaction, consensus};
@@ -25,6 +25,12 @@ pub struct BwatchRescan {
     pub blocks_processed: u64,
     pub blocks_total: u64,
     pub progress_percent: u64,
+    #[serde(default)]
+    pub script_matches_found: u64,
+    #[serde(default)]
+    pub outpoint_matches_found: u64,
+    #[serde(default)]
+    pub outpoints_followed: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
@@ -125,6 +131,29 @@ pub async fn rescan_watch_prefix(path: &Path, owner_prefix: &str, start_block: u
     Ok(())
 }
 
+pub async fn scan_watch_set(
+    path: &Path,
+    watches: &[(String, String)],
+    start_block: u32,
+) -> Result<BwatchScanResult> {
+    let mut rpc = ClnRpc::new(path)
+        .await
+        .with_context(|| format!("connecting to CLN RPC at {}", path.display()))?;
+    let params = json!({
+        "watches": watches
+            .iter()
+            .map(|(owner, scriptpubkey)| json!({
+                "owner": owner,
+                "scriptpubkey": scriptpubkey,
+            }))
+            .collect::<Vec<_>>(),
+        "start_block": start_block,
+    });
+    rpc.call_raw::<BwatchScanResult, _>("scanwatchset", &params)
+        .await
+        .map_err(|error| anyhow!("CLN RPC scanwatchset failed: {error:?}"))
+}
+
 pub async fn del_script_watch(path: &Path, owner: &str, scriptpubkey: &str) -> Result<()> {
     call(
         path,
@@ -140,6 +169,7 @@ pub async fn add_outpoint_watch(
     owner: &str,
     outpoint: &str,
     start_block: u32,
+    rescan: bool,
 ) -> Result<()> {
     call(
         path,
@@ -148,6 +178,7 @@ pub async fn add_outpoint_watch(
             "owner": owner,
             "outpoint": outpoint,
             "start_block": start_block,
+            "rescan": rescan,
         }),
     )
     .await?;
@@ -378,4 +409,37 @@ pub async fn block_timestamp(path: &Path, height: u32) -> Result<u64> {
     let block: Block = consensus::encode::deserialize_hex(raw)
         .with_context(|| format!("decoding block at height {height}"))?;
     Ok(u64::from(block.header.time))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BwatchStatus;
+    use serde_json::json;
+
+    #[test]
+    fn live_rescan_match_counters_are_relayed() {
+        let status: BwatchStatus = serde_json::from_value(json!({
+            "enabled": true,
+            "current_height": 852023,
+            "active_rescans": [{
+                "watch_type": "set",
+                "owners": ["plugin/tracker/treasury/spk/0/0"],
+                "start_height": 825000,
+                "current_height": 852023,
+                "target_height": 964806,
+                "blocks_processed": 27023,
+                "blocks_total": 139807,
+                "progress_percent": 19,
+                "script_matches_found": 12,
+                "outpoint_matches_found": 5,
+                "outpoints_followed": 11
+            }]
+        }))
+        .unwrap();
+        let scan = &status.active_rescans[0];
+
+        assert_eq!(scan.script_matches_found, 12);
+        assert_eq!(scan.outpoint_matches_found, 5);
+        assert_eq!(scan.outpoints_followed, 11);
+    }
 }

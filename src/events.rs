@@ -1,7 +1,7 @@
 use crate::cln;
 use crate::model::{
-    BwatchBlock, BwatchMatch, DescriptorStatus, MovementKind, PendingMovement, TrackedUtxo,
-    WatchOwner, outpoint_owner, parse_owner, script_owner,
+    BwatchBlock, BwatchMatch, DescriptorStatus, MAX_LOOKAHEAD, MovementKind, PendingMovement,
+    TrackedUtxo, WatchOwner, outpoint_owner, parse_owner, script_owner,
 };
 use crate::tracker::{
     AppState, current_bwatch_height, deliver_and_store, desired_range_end, drain_pending_movements,
@@ -51,6 +51,29 @@ pub async fn on_bwatch_match(plugin: Plugin<AppState>, value: Value) -> Result<(
     };
     let name = descriptor_name(&owner).to_owned();
     let result = match owner {
+        WatchOwner::Script { name, .. }
+            if event.historical_scan && event.watch_type == "outpoint" =>
+        {
+            let raw = event
+                .tx
+                .as_deref()
+                .context("historical outpoint match omitted transaction")?;
+            let input_index = event
+                .index
+                .context("historical outpoint match omitted input index")?;
+            let tx = cln::parse_transaction(raw)?;
+            let input = tx
+                .input
+                .get(usize::try_from(input_index).context("invalid input index")?)
+                .context("historical spend input is outside transaction")?;
+            handle_spend(
+                plugin.clone(),
+                event,
+                name,
+                input.previous_output.to_string(),
+            )
+            .await
+        }
         WatchOwner::Script {
             name,
             branch,
@@ -121,7 +144,14 @@ async fn handle_deposit(
         ),
         "descriptor '{name}' cannot accept matches"
     );
-    ensure_derivation_index_is_watched(derivation_index, original.range_end)?;
+    ensure_derivation_index_is_watched(
+        derivation_index,
+        if event.historical_scan {
+            MAX_LOOKAHEAD
+        } else {
+            original.range_end
+        },
+    )?;
     let descriptor = validate_config(&original.config, &plugin.state().network)?;
     let expected = descriptor.derive_one(branch, derivation_index)?;
     ensure!(
@@ -140,7 +170,10 @@ async fn handle_deposit(
         return Ok(());
     }
 
-    let timestamp = cln::block_timestamp(&plugin.state().rpc_path, event.blockheight).await?;
+    let timestamp = match event.timestamp {
+        Some(timestamp) => timestamp,
+        None => cln::block_timestamp(&plugin.state().rpc_path, event.blockheight).await?,
+    };
     let mut updated = original;
     let mut added_scripts = Vec::new();
     if updated
@@ -193,33 +226,36 @@ async fn handle_deposit(
             )
         })
         .collect::<Vec<_>>();
-    cln::add_script_watches(
-        &plugin.state().rpc_path,
-        &added_watches,
-        updated.config.birthheight,
-    )
-    .await
-    .context("extending descriptor lookahead frontier")?;
-    let added_owners = added_watches
-        .iter()
-        .map(|(owner, _)| owner.clone())
-        .collect::<Vec<_>>();
-    cln::rescan_watch_owners(
-        &plugin.state().rpc_path,
-        &added_owners,
-        updated.config.birthheight,
-    )
-    .await
-    .context("rescanning extended descriptor lookahead frontier")?;
-    cln::add_outpoint_watch(
-        &plugin.state().rpc_path,
-        &outpoint_owner(&name, &outpoint),
-        &outpoint,
-        event.blockheight,
-    )
-    .await
-    .context("registering spend watch for descriptor output")?;
-    if updated.status == DescriptorStatus::Syncing {
+    if !event.historical_scan {
+        cln::add_script_watches(
+            &plugin.state().rpc_path,
+            &added_watches,
+            updated.config.birthheight,
+        )
+        .await
+        .context("extending descriptor lookahead frontier")?;
+        let added_owners = added_watches
+            .iter()
+            .map(|(owner, _)| owner.clone())
+            .collect::<Vec<_>>();
+        cln::rescan_watch_owners(
+            &plugin.state().rpc_path,
+            &added_owners,
+            updated.config.birthheight,
+        )
+        .await
+        .context("rescanning extended descriptor lookahead frontier")?;
+        cln::add_outpoint_watch(
+            &plugin.state().rpc_path,
+            &outpoint_owner(&name, &outpoint),
+            &outpoint,
+            event.blockheight,
+            true,
+        )
+        .await
+        .context("registering spend watch for descriptor output")?;
+    }
+    if updated.status == DescriptorStatus::Syncing && !event.historical_scan {
         updated.status = DescriptorStatus::Active;
         cln::save_record(&plugin.state().rpc_path, &mut updated)
             .await
@@ -288,7 +324,10 @@ async fn handle_spend(
         "tracked outpoint already has a different spend"
     );
     let amount_msat = persisted.amount_msat;
-    let timestamp = cln::block_timestamp(&plugin.state().rpc_path, event.blockheight).await?;
+    let timestamp = match event.timestamp {
+        Some(timestamp) => timestamp,
+        None => cln::block_timestamp(&plugin.state().rpc_path, event.blockheight).await?,
+    };
     let mut updated = original;
     let utxo = updated.utxos.get_mut(&outpoint).expect("cloned above");
     utxo.spent_by = Some(spending_txid.clone());

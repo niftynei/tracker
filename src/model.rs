@@ -65,6 +65,8 @@ pub struct DescriptorRecord {
     pub last_used_index: Option<u32>,
     #[serde(default)]
     pub status: DescriptorStatus,
+    #[serde(default = "default_true")]
+    pub initial_scan_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incident: Option<TrackerIncident>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,6 +115,10 @@ fn default_confirmations() -> u32 {
     DEFAULT_CONFIRMATIONS
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct NameRequest {
     pub name: String,
@@ -133,7 +139,7 @@ pub struct ReconcileRequest {
     pub name: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BwatchMatch {
     pub owner: String,
     pub watch_type: String,
@@ -142,6 +148,18 @@ pub struct BwatchMatch {
     pub tx: Option<String>,
     #[serde(default)]
     pub index: Option<u32>,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
+    #[serde(default)]
+    pub historical_scan: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct BwatchScanResult {
+    pub start_block: u32,
+    pub target_block: u32,
+    pub blocks_processed: u64,
+    pub matches: Vec<BwatchMatch>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -271,6 +289,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(record.status, DescriptorStatus::Active);
+        assert!(record.initial_scan_complete);
         assert_eq!(record.config.confirmations, DEFAULT_CONFIRMATIONS);
         assert!(record.pending_movements.is_empty());
     }

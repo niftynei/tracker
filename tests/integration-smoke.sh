@@ -154,16 +154,34 @@ descriptor="$(wallet_cli listdescriptors \
   | jq -er '.descriptors | map(select(.active == true and .internal == false)) | first | .desc')"
 start_height=$(( $(btc_cli getblockcount) + 1 ))
 
-# A wide descriptor registration must scan its historical range once, not once
-# for each derived address.  Use a fresh wallet so this range contains no
-# matching outputs (and therefore no follow-up outpoint rescans).
+# A wide descriptor registration must scan its historical range once even when
+# an address beyond the initial lookahead received funds and that output was
+# later spent.  This exercises transient frontier discovery and dynamic
+# outpoint following, rather than the old empty-wallet fast path.
 btc_cli -named createwallet wallet_name=scan-wallet descriptors=true >/dev/null
-btc_cli -rpcwallet=scan-wallet getnewaddress >/dev/null
+for _scan_address_index in $(seq 0 51); do
+  scan_address="$(btc_cli -rpcwallet=scan-wallet getnewaddress)"
+done
 scan_descriptor="$(btc_cli -rpcwallet=scan-wallet listdescriptors \
-  | jq -er '.descriptors | map(select(.active == true and .internal == false)) | first | .desc')"
+  | jq -er '.descriptors | map(select(.active == true and .internal == false and (.desc | startswith("wpkh(")))) | first | .desc')"
+scan_deposit_txid="$(wallet_cli sendtoaddress "$scan_address" 0.01)"
+scan_deposit_hash="$(btc_cli generatetoaddress 1 "$mining_address" | jq -er '.[0]')"
+scan_birth="$(btc_cli getblockheader "$scan_deposit_hash" | jq -er '.height')"
+scan_deposit_vout="$(wallet_cli gettransaction "$scan_deposit_txid" \
+  | jq -er --arg address "$scan_address" '.details[] | select(.category == "send" and .address == $address) | .vout')"
+scan_destination="$(wallet_cli getnewaddress)"
+scan_raw_spend="$(btc_cli createrawtransaction \
+  "[{\"txid\":\"$scan_deposit_txid\",\"vout\":$scan_deposit_vout}]" \
+  "[{\"$scan_destination\":0.009}]")"
+scan_signed_spend="$(btc_cli -rpcwallet=scan-wallet signrawtransactionwithwallet "$scan_raw_spend" | jq -er '.hex')"
+scan_spend_txid="$(btc_cli sendrawtransaction "$scan_signed_spend")"
+btc_cli generatetoaddress 1 "$mining_address" >/dev/null
+btc_cli generatetoaddress 5 "$mining_address" >/dev/null
+scan_chain_tip="$(btc_cli getblockcount)"
+wait_for_jq ".bwatch.caught_up == true and .bwatch.current_height == $scan_chain_tip" \
+  'bwatch did not catch up before wallet scan' ln_cli tracker-health >/dev/null
 scan_before="$(ln_cli bwatch-status)"
 scan_tip="$(jq -er '.current_height' <<<"$scan_before")"
-scan_birth=$((scan_tip - 20))
 if ln_cli rescanwatchset \
   owner_prefix=plugin/ \
   start_block="$scan_birth" >/dev/null 2>&1; then
@@ -176,17 +194,19 @@ scan_registered="$(ln_cli tracker-register \
   lookahead=64 \
   confirmations=1)"
 assert_jq "$scan_registered" \
-  '.name == "wide-scan" and .lookahead == 64 and .range_end == 64 and .status == "active"' \
-  '64-address descriptor registration returned an unexpected record'
+  ".name == \"wide-scan\" and .lookahead == 64 and .range_end == 116 and .last_used_index == 51 and .status == \"active\" and (.tracked_utxos | length) == 1 and .tracked_utxos[0].spent_by == \"$scan_spend_txid\"" \
+  'single-pass descriptor registration missed the historical deposit or spend'
 assert_jq "$(ln_cli listwatch)" \
-  '[.watches[].owners[] | select(startswith("plugin/tracker/wide-scan/spk/"))] | length == 64' \
-  '64-address descriptor registration did not create 64 watches'
+  '[.watches[].owners[] | select(startswith("plugin/tracker/wide-scan/spk/"))] | length == 116' \
+  'descriptor registration did not persist the extended lookahead frontier'
 scan_after="$(ln_cli bwatch-status)"
 scan_completed_before="$(jq -er '.rescans_completed_total' <<<"$scan_before")"
 scan_blocks_before="$(jq -er '.rescan_blocks_processed_total' <<<"$scan_before")"
-assert_jq "$scan_after" \
+if ! jq -e \
   ".rescans_completed_total == ($scan_completed_before + 1) and .rescan_blocks_processed_total == ($scan_blocks_before + $scan_tip - $scan_birth + 1)" \
-  '64-address descriptor registration did not use exactly one historical block pass'
+  >/dev/null <<<"$scan_after"; then
+  fail "64-address descriptor registration did not use exactly one historical block pass (birth=$scan_birth tip=$scan_tip before=$scan_before after=$scan_after)"
+fi
 ln_cli tracker-unregister name=wide-scan >/dev/null
 
 # Checksums are enforced at the RPC boundary.

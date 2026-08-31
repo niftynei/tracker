@@ -1,9 +1,9 @@
 use crate::cln;
 use crate::descriptor::DescriptorSet;
 use crate::model::{
-    DescriptorConfig, DescriptorRecord, DescriptorStatus, MovementKind, NameRequest, OWNER_PREFIX,
-    ReconcileRequest, RegisterRequest, TrackerIncident, UpdateRequest, outpoint_owner,
-    script_owner, validate_confirmations, validate_lookahead, validate_name,
+    DescriptorConfig, DescriptorRecord, DescriptorStatus, MAX_LOOKAHEAD, MovementKind, NameRequest,
+    OWNER_PREFIX, ReconcileRequest, RegisterRequest, TrackerIncident, UpdateRequest,
+    outpoint_owner, script_owner, validate_confirmations, validate_lookahead, validate_name,
 };
 use anyhow::{Context, Error, Result, ensure};
 use cln_plugin::Plugin;
@@ -427,7 +427,11 @@ fn expected_watches(
     Ok(expected)
 }
 
-async fn reconcile_watches(state: &AppState, record: &DescriptorRecord) -> Result<()> {
+async fn reconcile_watches(
+    state: &AppState,
+    record: &DescriptorRecord,
+    rescan_missing: bool,
+) -> Result<()> {
     let descriptor = validate_config(&record.config, &state.network)?;
     let expected = expected_watches(record, &descriptor)?;
     let current = cln::list_owned_watches(&state.rpc_path, &owner_prefix(&record.config.name))
@@ -459,7 +463,11 @@ async fn reconcile_watches(state: &AppState, record: &DescriptorRecord) -> Resul
         .await
         .with_context(|| format!("restoring script watches for '{}'", record.config.name))?;
 
-    if record.status == DescriptorStatus::Syncing {
+    if !rescan_missing {
+        // A synchronous scanwatchset call already examined the complete
+        // historical range.  Install the durable frontier without fetching
+        // any of those blocks again.
+    } else if record.status == DescriptorStatus::Syncing {
         // A crash may have happened after only part of a registration batch
         // was persisted, or after its scan completed but before activation.
         // Replay the complete descriptor namespace to guarantee coverage; the
@@ -499,9 +507,15 @@ async fn reconcile_watches(state: &AppState, record: &DescriptorRecord) -> Resul
                     .get(outpoint)
                     .with_context(|| format!("missing tracked outpoint {outpoint}"))?
                     .deposit_height;
-                cln::add_outpoint_watch(&state.rpc_path, owner, outpoint, start_block)
-                    .await
-                    .with_context(|| format!("restoring outpoint watch {outpoint}"))?;
+                cln::add_outpoint_watch(
+                    &state.rpc_path,
+                    owner,
+                    outpoint,
+                    start_block,
+                    rescan_missing,
+                )
+                .await
+                .with_context(|| format!("restoring outpoint watch {outpoint}"))?;
             }
             // Blockdepth watches from older Tracker versions are omitted from
             // `expected` and removed by the difference pass above.
@@ -558,7 +572,11 @@ async fn reconcile_descriptor(state: &AppState, name: &str, tip_height: u32) -> 
         state.remove_record(name).await;
         return Ok(json!({ "name": name, "removed": true }));
     }
-    reconcile_watches(state, &record).await?;
+    ensure!(
+        record.initial_scan_complete,
+        "descriptor '{name}' has an interrupted initial scan; retry tracker-register with the same configuration"
+    );
+    reconcile_watches(state, &record, true).await?;
     record.status = DescriptorStatus::Active;
     mark_success(&mut record, "startup_reconciliation");
     cln::save_record(&state.rpc_path, &mut record)
@@ -676,9 +694,22 @@ pub async fn register(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
     };
     let descriptor = validate_config(&config, &plugin.state().network)?;
     let scripts = descriptor.derive_range(0, config.lookahead)?;
-    let _operation = plugin.state().lock_descriptor(&config.name).await;
+    let scan_end = if descriptor.is_ranged() {
+        MAX_LOOKAHEAD
+    } else {
+        1
+    };
+    let scan_scripts = descriptor
+        .derive_range(0, scan_end)
+        .context("deriving transient historical scan range")?;
+    let operation = plugin.state().lock_descriptor(&config.name).await;
     let records = plugin.state().records_snapshot().await;
-    ensure_no_script_overlap(&config.name, &scripts, &records, &plugin.state().network)?;
+    ensure_no_script_overlap(
+        &config.name,
+        &scan_scripts,
+        &records,
+        &plugin.state().network,
+    )?;
 
     let mut record = if let Some(existing) = records.get(&config.name) {
         ensure!(
@@ -699,6 +730,7 @@ pub async fn register(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
                 .unwrap_or(0),
             last_used_index: None,
             status: DescriptorStatus::Syncing,
+            initial_scan_complete: false,
             incident: None,
             last_success_at: None,
             generation: None,
@@ -710,9 +742,87 @@ pub async fn register(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
         record
     };
 
-    if let Err(error) = reconcile_watches(plugin.state(), &record)
+    drop(operation);
+
+    if !record.initial_scan_complete {
+        let transient_watches = scan_scripts
+            .into_iter()
+            .map(|script| {
+                (
+                    script_owner(&record.config.name, script.branch, script.index),
+                    script.scriptpubkey,
+                )
+            })
+            .collect::<Vec<_>>();
+        let scan = match cln::scan_watch_set(
+            &plugin.state().rpc_path,
+            &transient_watches,
+            record.config.birthheight,
+        )
         .await
-        .context("registering descriptor watches")
+        .context("scanning descriptor history in one block pass")
+        {
+            Ok(scan) => scan,
+            Err(error) => {
+                report_descriptor_failure(
+                    plugin.state(),
+                    &record.config.name,
+                    "register",
+                    &error,
+                    false,
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        ensure!(
+            scan.start_block == record.config.birthheight
+                && scan.blocks_processed
+                    == if scan.start_block > scan.target_block {
+                        0
+                    } else {
+                        u64::from(scan.target_block - scan.start_block) + 1
+                    },
+            "bwatch returned an incomplete wallet scan"
+        );
+        for mut event in scan.matches {
+            event.historical_scan = true;
+            if let Err(error) = crate::events::on_bwatch_match(
+                plugin.clone(),
+                serde_json::to_value(event).context("serializing historical match")?,
+            )
+            .await
+            .context("applying historical descriptor match")
+            {
+                report_descriptor_failure(
+                    plugin.state(),
+                    &record.config.name,
+                    "register",
+                    &error,
+                    false,
+                )
+                .await;
+                return Err(error);
+            }
+        }
+    }
+
+    let _operation = plugin.state().lock_descriptor(&record.config.name).await;
+    record = plugin
+        .state()
+        .record(&record.config.name)
+        .await
+        .context("descriptor disappeared while applying historical scan")?;
+    if !record.initial_scan_complete {
+        record.initial_scan_complete = true;
+        cln::save_record(&plugin.state().rpc_path, &mut record)
+            .await
+            .context("persisting completed initial scan")?;
+        plugin.state().put_record(record.clone()).await;
+    }
+    if let Err(error) = reconcile_watches(plugin.state(), &record, false)
+        .await
+        .context("installing descriptor watches after historical scan")
     {
         plugin.state().put_record(record.clone()).await;
         drop(_operation);
@@ -830,6 +940,11 @@ pub async fn update(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
     }
     if old.status == DescriptorStatus::Syncing {
         ensure!(
+            old.initial_scan_complete,
+            "descriptor '{}' has an interrupted initial scan; retry tracker-register with the same configuration",
+            request.name
+        );
+        ensure!(
             requested_lookahead == old.config.lookahead
                 && requested_confirmations == old.config.confirmations,
             "descriptor '{}' has an interrupted update; retry lookahead={} confirmations={} first",
@@ -838,7 +953,7 @@ pub async fn update(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
             old.config.confirmations
         );
         let mut active = old;
-        if let Err(error) = reconcile_watches(plugin.state(), &active)
+        if let Err(error) = reconcile_watches(plugin.state(), &active, true)
             .await
             .context("resuming descriptor watch reconciliation")
         {
@@ -884,7 +999,7 @@ pub async fn update(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
         .await
         .context("persisting updated lookahead intent")?;
     plugin.state().put_record(updated.clone()).await;
-    if let Err(error) = reconcile_watches(plugin.state(), &updated)
+    if let Err(error) = reconcile_watches(plugin.state(), &updated, true)
         .await
         .context("changing descriptor lookahead watches")
     {
@@ -1029,6 +1144,21 @@ fn metrics_from_health(health: &Value) -> Value {
         .flatten()
         .filter_map(|rescan| rescan.get("blocks_total").and_then(Value::as_u64))
         .sum::<u64>();
+    let rescan_script_matches = active_rescans
+        .into_iter()
+        .flatten()
+        .filter_map(|rescan| rescan.get("script_matches_found").and_then(Value::as_u64))
+        .sum::<u64>();
+    let rescan_outpoint_matches = active_rescans
+        .into_iter()
+        .flatten()
+        .filter_map(|rescan| rescan.get("outpoint_matches_found").and_then(Value::as_u64))
+        .sum::<u64>();
+    let rescan_outpoints_followed = active_rescans
+        .into_iter()
+        .flatten()
+        .filter_map(|rescan| rescan.get("outpoints_followed").and_then(Value::as_u64))
+        .sum::<u64>();
     let rescan_progress_ratio = if rescan_blocks_total == 0 {
         0.0
     } else {
@@ -1091,6 +1221,21 @@ fn metrics_from_health(health: &Value) -> Value {
             "bwatch_rescan_progress_ratio",
             "Aggregate completion ratio across active historical bwatch rescans.",
             json!(rescan_progress_ratio),
+        ),
+        gauge(
+            "bwatch_rescan_script_matches_found",
+            "Descriptor outputs found across active historical bwatch rescans.",
+            json!(rescan_script_matches),
+        ),
+        gauge(
+            "bwatch_rescan_outpoint_matches_found",
+            "Spending inputs found across active historical bwatch rescans.",
+            json!(rescan_outpoint_matches),
+        ),
+        gauge(
+            "bwatch_rescan_outpoints_followed",
+            "Unique matched outputs followed across active historical bwatch rescans.",
+            json!(rescan_outpoints_followed),
         ),
         counter(
             "reconciliation_failures_total",
@@ -1247,7 +1392,10 @@ mod tests {
                 "lag": 1,
                 "active_rescans": [{
                     "blocks_processed": 25,
-                    "blocks_total": 100
+                    "blocks_total": 100,
+                    "script_matches_found": 7,
+                    "outpoint_matches_found": 3,
+                    "outpoints_followed": 6
                 }]
             },
             "counters": {
@@ -1284,6 +1432,18 @@ mod tests {
             family("bwatch_rescan_progress_ratio")["samples"][0]["value"],
             0.25
         );
+        assert_eq!(
+            family("bwatch_rescan_script_matches_found")["samples"][0]["value"],
+            7
+        );
+        assert_eq!(
+            family("bwatch_rescan_outpoint_matches_found")["samples"][0]["value"],
+            3
+        );
+        assert_eq!(
+            family("bwatch_rescan_outpoints_followed")["samples"][0]["value"],
+            6
+        );
         assert_eq!(family("reorgs_total")["name"], "reorgs_total");
     }
 
@@ -1309,6 +1469,7 @@ mod tests {
                 range_end: 1,
                 last_used_index: None,
                 status: DescriptorStatus::Active,
+                initial_scan_complete: true,
                 incident: None,
                 last_success_at: None,
                 generation: None,

@@ -145,7 +145,9 @@ lightning-cli tracker-metrics
 `tracker`, and gauge/counter families containing numeric samples and bounded
 labels. The exporter discovers it through CLN's `help` RPC and publishes the
 families with a `cln_tracker_` prefix. `tracker-health` remains the richer
-human/operator diagnostic interface.
+human/operator diagnostic interface. Active rescans report live block progress,
+descriptor-output matches, spending-input matches, and unique outpoints being
+followed.
 
 After manually resolving an incident such as Bookkeeper reconciliation after a
 reorg, acknowledge it with:

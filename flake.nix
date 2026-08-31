@@ -83,6 +83,12 @@
                   "if ! command -v lowdown >/dev/null 2>&1; then"
             '';
             buildFlags = (old.buildFlags or [ ]) ++ [ "all-programs" ];
+            nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
+              pkgs.openssl
+              (pkgs.writeShellScriptBin "gsed" ''
+                exec ${pkgs.gnused}/bin/sed "$@"
+              '')
+            ];
             installTargets = [ "install-program" ];
             postInstall = "";
           });
