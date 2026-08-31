@@ -52,6 +52,13 @@ matched deposit or spend immediately, then evaluates pending movements once per
 `bwatch_block_processed` boundary. It does not inject a movement into Bookkeeper
 until the configured confirmation depth is reached.
 
+Initial historical registration uses a transient discovery horizon of 100,000
+indexes per descriptor branch, even when the durable lookahead is smaller. The
+scripts must be known before the block pass begins: if a match extends the
+lookahead frontier while scanning, a script introduced afterward could only be
+checked by downloading the blocks again. Only the frontier implied by actual
+matches plus the configured lookahead is installed as durable bwatch entries.
+
 Every descriptor must include a valid eight-character checksum. Extended-key
 network prefixes are checked against CLN's network. Public ranged, static, and
 BIP 389 multipath descriptors are supported. Static descriptors require a
@@ -76,6 +83,59 @@ open another network service. Automated callers that require JSON-only output
 can use `lightning-cli --notifications=none tracker-register ...` and inspect
 the same live scan through `tracker-health` from another client.
 
+Allocate the next receive address and attach an optional annotation:
+
+~~~console
+lightning-cli tracker-newaddr \
+  name=treasury \
+  branch=0 \
+  annotation='Quarterly reserve'
+~~~
+
+Tracker persists the allocation before returning it, never reuses an issued
+index, and extends the durable watch frontier through the issued index plus the
+configured lookahead. Address metadata is stored under independent
+`tracker/addresses/<name>/<branch>/<index>` datastore keys, so descriptor and
+movement updates do not rewrite an ever-growing address list. `minimum_index`
+can move a branch cursor forward when
+adopting a descriptor whose addresses were previously issued elsewhere:
+
+~~~console
+lightning-cli tracker-newaddr name=treasury branch=0 minimum_index=137
+~~~
+
+Branches have independent cursors and watch frontiers. List issued addresses in
+bounded pages (branch defaults to zero, limit defaults to 100 and is capped at
+1,000):
+
+~~~console
+lightning-cli tracker-listaddresses \
+  name=treasury \
+  branch=0 \
+  start=0 \
+  limit=100
+~~~
+
+When an annotated address receives funds, Tracker retains the annotation on the
+UTXO and applies it to the Bookkeeper credit event with
+`bkpr-editdescriptionbyoutpoint`. A failed injection or description update
+remains pending and is retried idempotently during reconciliation.
+
+Reconcile every annotated UTXO with Bookkeeper later:
+
+~~~console
+lightning-cli tracker-sync-descriptions name=treasury
+~~~
+
+Missing descriptions are populated and identical descriptions are reported as
+unchanged. A different Bookkeeper description is reported under `conflicts` and
+left untouched by default, preserving manual accounting edits. Explicitly make
+Tracker authoritative when desired:
+
+~~~console
+lightning-cli tracker-sync-descriptions name=treasury overwrite=true
+~~~
+
 Inspect:
 
 ~~~console
@@ -83,8 +143,11 @@ lightning-cli tracker-inspect name=treasury
 ~~~
 
 The response contains name, descriptor, birthheight, lookahead, confirmations,
-range_end, last_used_index, status, incident, last_success_at, branches,
-tracked_utxos, and pending_movements.
+range_end, last_used_index, status, initial_scan_complete, scan_operation_id,
+incident, last_success_at, branches, range_ends, last_used_indexes,
+next_indexes, tracked_utxos, and pending_movements. The singular range and used
+index fields remain aggregate compatibility views. A non-null scan_operation_id
+identifies an in-flight or crash-interrupted historical scan.
 
 Update the lookahead:
 
@@ -225,8 +288,8 @@ unfinished movements remain persisted in CLN's datastore.
 
 The Rust unit suite covers descriptor validation, migration defaults, owner
 encoding, range growth, and confirmation maturity. Tracker's flake pins commit
-`c902a7d4a11204fd78b754339f091a2c67f7715f` from the
-[`bwatch-plugin-block-events`](https://github.com/niftynei/lightning/tree/bwatch-plugin-block-events)
+`003ff3217ac940f3f41453d02ccb5103cbde26c2` from the
+[`bwatch-plugin-block-events-7d1f35d9`](https://github.com/niftynei/lightning/tree/bwatch-plugin-block-events-7d1f35d9)
 CLN branch. Its integration package deliberately builds only the CLN programs
 and plugins needed for regtest, avoiding unrelated manual and Rust-plugin build
 failures on macOS.

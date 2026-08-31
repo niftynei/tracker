@@ -52,6 +52,31 @@ wait_for_jq() {
   fail "$message"
 }
 
+replace_tracker_record() {
+  record_name=$1
+  jq_filter=$2
+  key="$(jq -cn --arg name "$record_name" '["tracker", "descriptors", $name]')"
+  response="$(ln_cli listdatastore key="$key")"
+  entry="$(jq -c '.datastore[0] // null' <<<"$response")"
+  if [[ "$entry" == null ]]; then
+    fail "descriptor datastore record is missing (name=$record_name response=$response)"
+  fi
+  generation="$(jq -er '.generation' <<<"$entry")" \
+    || fail "descriptor datastore record has no generation (entry=$entry)"
+  record="$(jq -er '.string' <<<"$entry")" \
+    || fail "descriptor datastore record has no JSON string (entry=$entry)"
+  jq -e . >/dev/null <<<"$record" \
+    || fail "descriptor datastore record is invalid JSON (record=$record)"
+  updated="$(jq -cer "$jq_filter" <<<"$record")" \
+    || fail "could not construct crash snapshot (filter=$jq_filter record=$record)"
+  encoded_updated="$(jq -cn --arg value "$updated" '$value')"
+  ln_cli datastore \
+    key="$key" \
+    string="$encoded_updated" \
+    mode=must-replace \
+    generation="$generation" >/dev/null
+}
+
 cleanup() {
   status=$?
   if [[ "$status" -ne 0 ]]; then
@@ -319,12 +344,36 @@ assert_jq "$(ln_cli listwatch)" \
   '[.watches[].owners[] | select(startswith("plugin/tracker/treasury/spk/"))] | length == 5' \
   'lookahead growth did not add descriptor watches'
 
-# Fund index zero and wait for Tracker plus Bookkeeper to process the block.
-tracked_address="$(btc_cli deriveaddresses "$descriptor" '[0,0]' | jq -er '.[0]')"
+# Allocate index zero with durable address metadata. The issued index advances
+# the watched frontier before the address is returned, and its annotation must
+# become the Bookkeeper description when that address receives a deposit.
+issued="$(ln_cli tracker-newaddr \
+  name=treasury \
+  branch=0 \
+  annotation="Quarterly reserve")"
+assert_jq "$issued" \
+  '.name == "treasury" and .branch == 0 and .index == 0 and .annotation == "Quarterly reserve" and .next_index == 1 and .range_end == 6' \
+  'tracker-newaddr did not allocate and advance the descriptor frontier'
+tracked_address="$(jq -er '.address' <<<"$issued")"
+issued_inspect="$(ln_cli tracker-inspect name=treasury)"
+assert_jq "$issued_inspect" \
+  '.next_indexes["0"] == 1 and .range_ends["0"] == 6' \
+  'tracker-inspect did not retain the issued address cursor and frontier'
+issued_addresses="$(ln_cli tracker-listaddresses name=treasury branch=0 start=0 limit=10)"
+assert_jq "$issued_addresses" \
+  '.addresses[0].annotation == "Quarterly reserve" and .addresses[0].index == 0 and .next_start == null' \
+  'tracker-listaddresses did not return issued address metadata'
+[[ "$(jq -er '.addresses[0].address' <<<"$issued_addresses")" == "$tracked_address" ]] \
+  || fail 'tracker-listaddresses returned the wrong issued address'
+assert_jq "$(ln_cli listwatch)" \
+  '[.watches[].owners[] | select(startswith("plugin/tracker/treasury/spk/"))] | length == 6' \
+  'tracker-newaddr returned before installing its extended watch frontier'
+
+# Fund the issued address and wait for Tracker plus Bookkeeper to process it.
 deposit_txid="$(wallet_cli sendtoaddress "$tracked_address" 0.1)"
 btc_cli generatetoaddress 1 "$mining_address" >/dev/null
 treasury="$(wait_for_jq \
-  '(.tracked_utxos | length) == 1 and .pending_movements == [] and .last_used_index == 0' \
+  '(.tracked_utxos | length) == 1 and .tracked_utxos[0].annotation == "Quarterly reserve" and .pending_movements == [] and .last_used_index == 0' \
   'tracker did not discover and deliver the deposit' \
   ln_cli tracker-inspect name=treasury)"
 outpoint="$(jq -er '.tracked_utxos[0].outpoint' <<<"$treasury")"
@@ -334,9 +383,87 @@ assert_jq "$(ln_cli listwatch)" \
   '[.watches[].owners[] | select(startswith("plugin/tracker/treasury/outpoint/"))] | length == 1' \
   'deposit did not create an outpoint watch'
 wait_for_jq \
-  ".events | map(select(.account == \"treasury\" and .outpoint == \"$outpoint\" and .credit_msat != 0 and .credit_msat != \"0msat\")) | length == 1" \
-  'Bookkeeper did not receive exactly one deposit' \
+  ".events | map(select(.account == \"treasury\" and .outpoint == \"$outpoint\" and .credit_msat != 0 and .credit_msat != \"0msat\" and .description == \"Quarterly reserve\")) | length == 1" \
+  'Bookkeeper did not receive exactly one annotated deposit' \
   ln_cli bkpr-listaccountevents >/dev/null
+
+# Description reconciliation preserves a manual Bookkeeper edit unless the
+# caller explicitly elects to make Tracker's annotation authoritative.
+ln_cli bkpr-editdescriptionbyoutpoint \
+  outpoint="$outpoint" \
+  description="Manual accounting override" >/dev/null
+description_conflict="$(ln_cli tracker-sync-descriptions name=treasury)"
+assert_jq "$description_conflict" \
+  '.synced == [] and (.conflicts | length) == 1 and .conflicts[0].tracker_annotation == "Quarterly reserve" and .conflicts[0].bookkeeper_description == "Manual accounting override"' \
+  'description sync did not preserve and report a Bookkeeper conflict'
+assert_jq "$(ln_cli bkpr-listaccountevents account=treasury)" \
+  "[.events[] | select(.outpoint == \"$outpoint\" and .credit_msat != 0 and .credit_msat != \"0msat\")][0].description == \"Manual accounting override\"" \
+  'non-overwriting description sync changed a manual Bookkeeper edit'
+description_overwrite="$(ln_cli tracker-sync-descriptions name=treasury overwrite=true)"
+assert_jq "$description_overwrite" \
+  ".conflicts == [] and .synced == [\"$outpoint\"]" \
+  'overwriting description sync did not restore Tracker metadata'
+wait_for_jq \
+  ".events | map(select(.account == \"treasury\" and .outpoint == \"$outpoint\" and .credit_msat != 0 and .credit_msat != \"0msat\" and .description == \"Quarterly reserve\")) | length == 1" \
+  'overwriting description sync did not update Bookkeeper' \
+  ln_cli bkpr-listaccountevents >/dev/null
+
+# Real concurrent allocations are serialized per descriptor and must never
+# return the same index.
+concurrent_one="$test_root/concurrent-address-one.json"
+concurrent_two="$test_root/concurrent-address-two.json"
+ln_cli tracker-newaddr name=treasury branch=0 annotation="Concurrent one" >"$concurrent_one" &
+concurrent_one_pid=$!
+ln_cli tracker-newaddr name=treasury branch=0 annotation="Concurrent two" >"$concurrent_two" &
+concurrent_two_pid=$!
+wait "$concurrent_one_pid"
+wait "$concurrent_two_pid"
+concurrent_indexes="$(jq -cs '[.[].index] | sort' "$concurrent_one" "$concurrent_two")"
+[[ "$concurrent_indexes" == '[1,2]' ]] \
+  || fail "concurrent tracker-newaddr calls reused or skipped an index (indexes=$concurrent_indexes)"
+
+# Reproduce a crash immediately after the independent address record is
+# durable but before the descriptor cursor and watches are updated. Startup
+# must recover the cursor from the address namespace, install the branch's
+# missing watches, and never issue the stranded index again.
+tracker_plugin="$(command -v cln-tracker)"
+ln_cli plugin stop "$tracker_plugin" >/dev/null
+crashed_index=7
+crashed_address="$(btc_cli deriveaddresses "$descriptor" "[$crashed_index,$crashed_index]" | jq -er '.[0]')"
+crashed_script="$(wallet_cli getaddressinfo "$crashed_address" | jq -er '.scriptPubKey')"
+crashed_record="$(jq -cn \
+  --arg name treasury \
+  --arg address "$crashed_address" \
+  --arg scriptpubkey "$crashed_script" \
+  --arg annotation "Crash boundary" \
+  --argjson index "$crashed_index" \
+  --argjson issued_at "$(date +%s)" \
+  '{name: $name, branch: 0, index: $index, address: $address, scriptpubkey: $scriptpubkey, annotation: $annotation, issued_at: $issued_at}')"
+crashed_key="$(jq -cn --arg index "$crashed_index" '["tracker", "addresses", "treasury", "0", $index]')"
+crashed_record_hex="$(printf '%s' "$crashed_record" | od -An -v -tx1 | tr -d ' \n')"
+ln_cli datastore \
+  key="$crashed_key" \
+  hex="$crashed_record_hex" \
+  mode=must-create >/dev/null
+assert_jq "$(ln_cli listdatastore key="$crashed_key")" \
+  '.datastore[0].string | fromjson | .index == 7 and .annotation == "Crash boundary"' \
+  'could not persist the simulated address-allocation crash record'
+ln_cli plugin start "$tracker_plugin" >/dev/null
+wait_for_jq \
+  '.status == "active" and .next_indexes["0"] == 8 and .range_ends["0"] == 13' \
+  'startup did not recover the address allocation crash boundary' \
+  ln_cli tracker-inspect name=treasury >/dev/null
+assert_jq "$(ln_cli tracker-listaddresses name=treasury branch=0 start=0 limit=10)" \
+  '[.addresses[].index] == [0,1,2,7]' \
+  'address listing did not include the independently persisted crash record'
+post_crash_address="$(ln_cli tracker-newaddr name=treasury branch=0 annotation="After crash")"
+assert_jq "$post_crash_address" \
+  '.index == 8 and .next_index == 9 and .range_ends["0"] == 14' \
+  'address allocation reused an index after crash recovery'
+expected_script_watches=14
+assert_jq "$(ln_cli listwatch)" \
+  "[.watches[].owners[] | select(startswith(\"plugin/tracker/treasury/spk/0/\"))] | length == $expected_script_watches" \
+  'crash recovery did not install the recovered branch frontier'
 
 # Remove one expected watch behind Tracker's back, then prove startup
 # reconciliation restores it without duplicating the Bookkeeper deposit.
@@ -345,7 +472,6 @@ watch_to_remove="$(ln_cli listwatch | jq -cer \
 ln_cli delscriptpubkeywatch \
   owner="$(jq -r '.owner' <<<"$watch_to_remove")" \
   scriptpubkey="$(jq -r '.scriptpubkey' <<<"$watch_to_remove")" >/dev/null
-tracker_plugin="$(command -v cln-tracker)"
 ln_cli plugin stop "$tracker_plugin" >/dev/null
 ln_cli plugin start "$tracker_plugin" >/dev/null
 wait_for_jq '.status == "active" and (.tracked_utxos | length == 1)' \
@@ -390,9 +516,104 @@ assert_jq "$(ln_cli tracker-list)" '.descriptors == []' \
 assert_jq "$(ln_cli listwatch)" \
   '[.watches[].owners[] | select(startswith("plugin/tracker/treasury/"))] | length == 0' \
   'unregistration left tracker-owned bwatch entries'
+treasury_address_key='["tracker","addresses","treasury"]'
+assert_jq "$(ln_cli listdatastore key="$treasury_address_key")" \
+  '.datastore == []' \
+  'unregistration left issued address metadata'
 if ln_cli tracker-inspect name=treasury >/dev/null 2>&1; then
   fail 'tracker-inspect succeeded after unregistration'
 fi
+
+# Multipath descriptors maintain independent branch frontiers: issuing a far
+# receive address must not expand the change branch to the same index.
+descriptor_body="${descriptor%#*}"
+multipath_body="$(jq -nr --arg descriptor "$descriptor_body" \
+  '$descriptor | sub("/0/\\*"; "/<0;1>/*")')"
+[[ "$multipath_body" != "$descriptor_body" ]] \
+  || fail 'integration wallet descriptor could not be converted to multipath form'
+multipath_checksum="$(btc_cli getdescriptorinfo "$multipath_body" | jq -er '.checksum')"
+multipath_descriptor="${multipath_body}#${multipath_checksum}"
+multipath_start=$(( $(btc_cli getblockcount) + 1 ))
+ln_cli tracker-register \
+  name=branch-frontiers \
+  descriptor="$multipath_descriptor" \
+  birthheight="$multipath_start" \
+  lookahead=2 \
+  confirmations=1 >/dev/null
+branch_receive="$(ln_cli tracker-newaddr \
+  name=branch-frontiers branch=0 minimum_index=10 annotation="Far receive")"
+jq -e '.index == 10 and .range_ends["0"] == 13 and .range_ends["1"] == 2' \
+  >/dev/null <<<"$branch_receive" \
+  || fail "receive allocation incorrectly expanded every descriptor branch (response=$branch_receive)"
+branch_change="$(ln_cli tracker-newaddr \
+  name=branch-frontiers branch=1 annotation="First change")"
+jq -e '.index == 0 and .range_ends["0"] == 13 and .range_ends["1"] == 3' \
+  >/dev/null <<<"$branch_change" \
+  || fail "change allocation did not maintain an independent branch frontier (response=$branch_change)"
+assert_jq "$(ln_cli listwatch)" \
+  '[.watches[].owners[] | select(startswith("plugin/tracker/branch-frontiers/spk/0/"))] | length == 13' \
+  'receive branch installed the wrong number of watches'
+assert_jq "$(ln_cli listwatch)" \
+  '[.watches[].owners[] | select(startswith("plugin/tracker/branch-frontiers/spk/1/"))] | length == 3' \
+  'change branch installed the wrong number of watches'
+ln_cli tracker-unregister name=branch-frontiers >/dev/null
+
+# Reproduce the durable snapshots left when Tracker exits immediately after
+# persisting registration, rescan, and deletion intent.  A restarted plugin
+# must expose the interrupted scan identity, accept only the matching retry,
+# clear that identity on success, and finish a pending deletion automatically.
+crash_name=crash-recovery
+crash_start=$(( $(btc_cli getblockcount) + 1 ))
+ln_cli tracker-register \
+  name="$crash_name" \
+  descriptor="$descriptor" \
+  birthheight="$crash_start" \
+  lookahead=3 \
+  confirmations=1 >/dev/null
+
+ln_cli plugin stop "$tracker_plugin" >/dev/null
+replace_tracker_record "$crash_name" \
+  '.status = "syncing" | .initial_scan_complete = false | .scan_operation_id = "crashed-registration"'
+ln_cli plugin start "$tracker_plugin" >/dev/null
+crashed_registration="$(ln_cli tracker-inspect name="$crash_name")"
+assert_jq "$crashed_registration" \
+  '.status == "syncing" and .initial_scan_complete == false and .scan_operation_id == "crashed-registration"' \
+  "startup did not preserve the interrupted registration identity (inspect=$crashed_registration)"
+assert_jq "$(ln_cli -N none tracker-register \
+  name="$crash_name" \
+  descriptor="$descriptor" \
+  birthheight="$crash_start" \
+  lookahead=3 \
+  confirmations=1)" \
+  '.status == "active" and .scan_operation_id == null' \
+  'registration retry did not replace and clear the crashed scan identity'
+
+ln_cli plugin stop "$tracker_plugin" >/dev/null
+replace_tracker_record "$crash_name" \
+  ".status = \"syncing\" | .pending_rescan = {start_block: $crash_start} | .scan_operation_id = \"crashed-rescan\""
+ln_cli plugin start "$tracker_plugin" >/dev/null
+crashed_rescan="$(ln_cli tracker-inspect name="$crash_name")"
+assert_jq "$crashed_rescan" \
+  '.status == "syncing" and .pending_rescan != null and .scan_operation_id == "crashed-rescan"' \
+  "startup did not preserve the interrupted rescan identity (inspect=$crashed_rescan)"
+assert_jq "$(ln_cli -N none tracker-rescan \
+  name="$crash_name" \
+  start_block="$crash_start" \
+  lookahead=3)" \
+  '.status == "active" and .pending_rescan == null and .scan_operation_id == null' \
+  'rescan retry did not replace and clear the crashed scan identity'
+
+ln_cli plugin stop "$tracker_plugin" >/dev/null
+replace_tracker_record "$crash_name" \
+  '.status = "deleting" | .scan_operation_id = null'
+ln_cli plugin start "$tracker_plugin" >/dev/null
+wait_for_jq \
+  "[.descriptors[] | select(.name == \"$crash_name\")] | length == 0" \
+  'startup did not finish the deletion left by a crash' \
+  ln_cli tracker-list >/dev/null
+assert_jq "$(ln_cli listwatch)" \
+  "[.watches[].owners[] | select(startswith(\"plugin/tracker/$crash_name/\"))] | length == 0" \
+  'crash-recovered deletion left tracker-owned watches'
 
 # Create wallet activity before registration and prove the birthheight rescan
 # discovers it. A following block supplies the normal processed boundary used
