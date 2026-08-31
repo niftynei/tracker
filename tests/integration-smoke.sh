@@ -187,15 +187,19 @@ if ln_cli rescanwatchset \
   start_block="$scan_birth" >/dev/null 2>&1; then
   fail "bwatch accepted the dangerously broad plugin/ rescan prefix"
 fi
-scan_registered="$(ln_cli tracker-register \
+scan_registration_output="$(ln_cli --raw tracker-register \
   name=wide-scan \
   descriptor="$scan_descriptor" \
   birthheight="$scan_birth" \
   lookahead=64 \
   confirmations=1)"
+if ! grep -Eq $'# [[:space:]]*[0-9]+/[0-9]+ .*\|=+\|' <<<"$scan_registration_output"; then
+  fail "tracker-register did not stream block scan progress (output=$scan_registration_output)"
+fi
+scan_registered="$(ln_cli -N none tracker-inspect name=wide-scan)"
 assert_jq "$scan_registered" \
   ".name == \"wide-scan\" and .lookahead == 64 and .range_end == 116 and .last_used_index == 51 and .status == \"active\" and (.tracked_utxos | length) == 1 and .tracked_utxos[0].spent_by == \"$scan_spend_txid\"" \
-  'single-pass descriptor registration missed the historical deposit or spend'
+  "single-pass descriptor registration missed the historical deposit or spend (inspect=$scan_registered)"
 assert_jq "$(ln_cli listwatch)" \
   '[.watches[].owners[] | select(startswith("plugin/tracker/wide-scan/spk/"))] | length == 116' \
   'descriptor registration did not persist the extended lookahead frontier'
@@ -207,6 +211,57 @@ if ! jq -e \
   >/dev/null <<<"$scan_after"; then
   fail "64-address descriptor registration did not use exactly one historical block pass (birth=$scan_birth tip=$scan_tip before=$scan_before after=$scan_after)"
 fi
+
+# Put a deposit beyond the installed frontier, spend it, and recover both with
+# one explicit Tracker rescan. The supplied lookahead becomes the durable gap.
+for _rescan_address_index in $(seq 52 119); do
+  rescan_address="$(btc_cli -rpcwallet=scan-wallet getnewaddress)"
+done
+rescan_deposit_txid="$(wallet_cli sendtoaddress "$rescan_address" 0.01)"
+rescan_deposit_hash="$(btc_cli generatetoaddress 1 "$mining_address" | jq -er '.[0]')"
+rescan_start="$(btc_cli getblockheader "$rescan_deposit_hash" | jq -er '.height')"
+rescan_deposit_vout="$(wallet_cli gettransaction "$rescan_deposit_txid" \
+  | jq -er --arg address "$rescan_address" '.details[] | select(.category == "send" and .address == $address) | .vout')"
+rescan_destination="$(wallet_cli getnewaddress)"
+rescan_raw_spend="$(btc_cli createrawtransaction \
+  "[{\"txid\":\"$rescan_deposit_txid\",\"vout\":$rescan_deposit_vout}]" \
+  "[{\"$rescan_destination\":0.009}]")"
+rescan_signed_spend="$(btc_cli -rpcwallet=scan-wallet signrawtransactionwithwallet "$rescan_raw_spend" | jq -er '.hex')"
+rescan_spend_txid="$(btc_cli sendrawtransaction "$rescan_signed_spend")"
+btc_cli generatetoaddress 1 "$mining_address" >/dev/null
+btc_cli generatetoaddress 5 "$mining_address" >/dev/null
+rescan_tip="$(btc_cli getblockcount)"
+wait_for_jq ".bwatch.caught_up == true and .bwatch.current_height == $rescan_tip" \
+  'bwatch did not catch up before explicit descriptor rescan' ln_cli tracker-health >/dev/null
+rescan_before="$(ln_cli bwatch-status)"
+rescan_output="$(ln_cli --raw tracker-rescan \
+  name=wide-scan \
+  start_block="$rescan_start" \
+  lookahead=100)"
+if ! grep -Eq $'# [[:space:]]*[0-9]+/[0-9]+ .*\|=+\|' <<<"$rescan_output"; then
+  fail "tracker-rescan did not stream block scan progress (output=$rescan_output)"
+fi
+rescanned="$(ln_cli -N none tracker-inspect name=wide-scan)"
+assert_jq "$rescanned" \
+  ".name == \"wide-scan\" and .lookahead == 100 and .range_end == 220 and .last_used_index == 119 and .status == \"active\" and .pending_rescan == null and (.tracked_utxos | length) == 2 and ([.tracked_utxos[] | select(.spent_by == \"$rescan_spend_txid\")] | length) == 1" \
+  'tracker-rescan missed the beyond-frontier deposit or its later spend'
+assert_jq "$(ln_cli listwatch)" \
+  '[.watches[].owners[] | select(startswith("plugin/tracker/wide-scan/spk/"))] | length == 220' \
+  'tracker-rescan did not persist the widened descriptor frontier'
+rescan_after="$(ln_cli bwatch-status)"
+rescan_completed_before="$(jq -er '.rescans_completed_total' <<<"$rescan_before")"
+rescan_blocks_before="$(jq -er '.rescan_blocks_processed_total' <<<"$rescan_before")"
+if ! jq -e \
+  ".rescans_completed_total == ($rescan_completed_before + 1) and .rescan_blocks_processed_total == ($rescan_blocks_before + $rescan_tip - $rescan_start + 1)" \
+  >/dev/null <<<"$rescan_after"; then
+  fail "tracker-rescan did not use exactly one historical block pass (start=$rescan_start tip=$rescan_tip before=$rescan_before after=$rescan_after)"
+fi
+future_rescan="$(ln_cli -N none tracker-rescan \
+  name=wide-scan \
+  start_block=$((rescan_tip + 1)))"
+assert_jq "$future_rescan" \
+  ".lookahead == 100 and .rescan.start_block == ($rescan_tip + 1) and .rescan.target_block == $rescan_tip and .rescan.blocks_processed == 0 and .rescan.matches_found == 0" \
+  'tracker-rescan did not return the expected structured zero-block result with omitted lookahead'
 ln_cli tracker-unregister name=wide-scan >/dev/null
 
 # Checksums are enforced at the RPC boundary.
@@ -220,7 +275,7 @@ if ln_cli tracker-register \
 fi
 
 # Register, inspect, and verify the initial bwatch ownership.
-registered="$(ln_cli tracker-register \
+registered="$(ln_cli -N none tracker-register \
   name=treasury \
   descriptor="$descriptor" \
   birthheight="$start_height" \

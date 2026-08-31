@@ -8,14 +8,14 @@ description = "A Core Lightning plugin for tracking wallet output descriptors wi
 
 [dependencies]
 anyhow = "1.0"
-cln-plugin = "0.7.0"
+cln-plugin = { git = "https://github.com/niftynei/lightning.git", rev = "003ff3217ac940f3f41453d02ccb5103cbde26c2" }
 cln-rpc = "0.7.0"
 hex = "0.4"
 log = "0.4"
 miniscript = { version = "13.1.0", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.47", features = ["macros", "rt", "sync"] }
+tokio = { version = "1.47", features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 pretty_assertions = "1.4"

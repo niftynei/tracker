@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     cln-bwatch = {
-      url = "github:niftynei/lightning/c902a7d4a11204fd78b754339f091a2c67f7715f";
+      url = "github:niftynei/lightning/003ff3217ac940f3f41453d02ccb5103cbde26c2";
       flake = false;
     };
     cln-gheap = {
@@ -49,7 +49,12 @@
                 ./src
               ];
             };
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              outputHashes = {
+                "cln-plugin-0.7.0" = "sha256-jkzEjNCiAIyN0N2P8E2zZLnS86AMMdus0MPJC8WScSQ=";
+              };
+            };
             nativeBuildInputs = [ pkgs.pkg-config ];
             doCheck = true;
           };
@@ -156,7 +161,7 @@
               rustc
               rustfmt
             ];
-            CLN_BWATCH_COMMIT = "c902a7d4a11204fd78b754339f091a2c67f7715f";
+            CLN_BWATCH_COMMIT = "003ff3217ac940f3f41453d02ccb5103cbde26c2";
             CLN_BWATCH_SOURCE = p.cln-source;
           };
         });

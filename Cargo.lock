@@ -127,8 +127,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "cln-plugin"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9a4bb9c7335040d49c51900305b91155303539e9f54839bb194e915277bf882"
+source = "git+https://github.com/niftynei/lightning.git?rev=003ff3217ac940f3f41453d02ccb5103cbde26c2#003ff3217ac940f3f41453d02ccb5103cbde26c2"
 dependencies = [
  "anyhow",
  "bytes",

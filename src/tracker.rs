@@ -2,18 +2,20 @@ use crate::cln;
 use crate::descriptor::DescriptorSet;
 use crate::model::{
     DescriptorConfig, DescriptorRecord, DescriptorStatus, MAX_LOOKAHEAD, MovementKind, NameRequest,
-    OWNER_PREFIX, ReconcileRequest, RegisterRequest, TrackerIncident, UpdateRequest,
-    outpoint_owner, script_owner, validate_confirmations, validate_lookahead, validate_name,
+    OWNER_PREFIX, PendingRescan, ReconcileRequest, RegisterRequest, RescanRequest, TrackerIncident,
+    UpdateRequest, outpoint_owner, script_owner, validate_confirmations, validate_lookahead,
+    validate_name,
 };
 use anyhow::{Context, Error, Result, ensure};
-use cln_plugin::Plugin;
+use cln_plugin::{Plugin, RequestContext};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::time::MissedTickBehavior;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -153,8 +155,12 @@ async fn persist_failure(
 }
 
 fn mark_success(record: &mut DescriptorRecord, operation: &str) {
-    let lifecycle_operation =
-        |value: &str| matches!(value, "register" | "update" | "startup_reconciliation");
+    let lifecycle_operation = |value: &str| {
+        matches!(
+            value,
+            "register" | "rescan" | "update" | "startup_reconciliation"
+        )
+    };
     let bookkeeper_operation = |value: &str| value.starts_with("bookkeeper");
     if record.incident.as_ref().is_some_and(|incident| {
         !incident.operator_action_required
@@ -576,6 +582,10 @@ async fn reconcile_descriptor(state: &AppState, name: &str, tip_height: u32) -> 
         record.initial_scan_complete,
         "descriptor '{name}' has an interrupted initial scan; retry tracker-register with the same configuration"
     );
+    ensure!(
+        record.pending_rescan.is_none(),
+        "descriptor '{name}' has an interrupted rescan; retry tracker-rescan to resume it"
+    );
     reconcile_watches(state, &record, true).await?;
     record.status = DescriptorStatus::Active;
     mark_success(&mut record, "startup_reconciliation");
@@ -674,7 +684,154 @@ pub async fn reconcile(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
     Ok(json!({ "reconciled": reconciled }))
 }
 
-pub async fn register(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
+fn rpc_progress(blocks_processed: u64, blocks_total: u64) -> Option<(u32, u32)> {
+    // lightning-cli's progress renderer expects a zero-indexed numerator and
+    // currently cannot render a one-item progress bar.
+    if blocks_processed == 0 || blocks_total < 2 {
+        return None;
+    }
+    let total = u32::try_from(blocks_total).ok()?;
+    let completed = u32::try_from(blocks_processed.min(blocks_total)).ok()?;
+    Some((completed - 1, total))
+}
+
+async fn report_scan_progress(
+    request_context: &RequestContext,
+    last_progress: &mut Option<(u32, u32)>,
+    blocks_processed: u64,
+    blocks_total: u64,
+) {
+    let Some(progress) = rpc_progress(blocks_processed, blocks_total) else {
+        return;
+    };
+    if Some(progress) == *last_progress {
+        return;
+    }
+    if let Err(error) = request_context.progress(progress.0, progress.1, None).await {
+        log::warn!("could not report descriptor scan progress: {error:#}");
+        return;
+    }
+    *last_progress = Some(progress);
+}
+
+async fn scan_watch_set_with_progress(
+    plugin: &Plugin<AppState>,
+    request_context: &RequestContext,
+    name: &str,
+    watches: &[(String, String)],
+    start_block: u32,
+) -> Result<crate::model::BwatchScanResult> {
+    let scan = cln::scan_watch_set(&plugin.state().rpc_path, watches, start_block);
+    tokio::pin!(scan);
+    let mut poll = tokio::time::interval(Duration::from_secs(1));
+    poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let expected_owner_prefix = owner_prefix(name);
+    let mut last_progress = None;
+
+    loop {
+        tokio::select! {
+            result = &mut scan => {
+                let result = result?;
+                let total = if result.start_block > result.target_block {
+                    0
+                } else {
+                    u64::from(result.target_block - result.start_block) + 1
+                };
+                report_scan_progress(
+                    request_context,
+                    &mut last_progress,
+                    result.blocks_processed,
+                    total,
+                ).await;
+                return Ok(result);
+            }
+            _ = poll.tick() => {
+                match cln::bwatch_status(&plugin.state().rpc_path).await {
+                    Ok(status) => {
+                        if let Some(rescan) = status.active_rescans.iter().find(|rescan| {
+                            rescan.watch_type == "set"
+                                && rescan.owners.iter().any(|owner| {
+                                    owner.starts_with(&expected_owner_prefix)
+                                })
+                        }) {
+                            report_scan_progress(
+                                request_context,
+                                &mut last_progress,
+                                rescan.blocks_processed,
+                                rescan.blocks_total,
+                            ).await;
+                        }
+                    }
+                    Err(error) => {
+                        log::debug!("could not poll bwatch scan progress: {error:#}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HistoricalScanSummary {
+    start_block: u32,
+    target_block: u32,
+    blocks_processed: u64,
+    matches_found: u64,
+    deposits_matched: u64,
+    spends_matched: u64,
+}
+
+async fn apply_historical_scan(
+    plugin: &Plugin<AppState>,
+    expected_start_block: u32,
+    scan: crate::model::BwatchScanResult,
+) -> Result<HistoricalScanSummary> {
+    let expected_blocks = if scan.start_block > scan.target_block {
+        0
+    } else {
+        u64::from(scan.target_block - scan.start_block) + 1
+    };
+    ensure!(
+        scan.start_block == expected_start_block && scan.blocks_processed == expected_blocks,
+        "bwatch returned an incomplete wallet scan"
+    );
+    let summary = HistoricalScanSummary {
+        start_block: scan.start_block,
+        target_block: scan.target_block,
+        blocks_processed: scan.blocks_processed,
+        matches_found: u64::try_from(scan.matches.len()).unwrap_or(u64::MAX),
+        deposits_matched: u64::try_from(
+            scan.matches
+                .iter()
+                .filter(|event| event.watch_type == "scriptpubkey")
+                .count(),
+        )
+        .unwrap_or(u64::MAX),
+        spends_matched: u64::try_from(
+            scan.matches
+                .iter()
+                .filter(|event| event.watch_type == "outpoint")
+                .count(),
+        )
+        .unwrap_or(u64::MAX),
+    };
+    for mut event in scan.matches {
+        event.historical_scan = true;
+        crate::events::on_bwatch_match(
+            plugin.clone(),
+            serde_json::to_value(event).context("serializing historical match")?,
+        )
+        .await
+        .context("applying historical descriptor match")?;
+    }
+    Ok(summary)
+}
+
+pub async fn register(
+    plugin: Plugin<AppState>,
+    request_context: RequestContext,
+    args: Value,
+) -> Result<Value> {
     let request: RegisterRequest = parse_request(
         args,
         &[
@@ -713,7 +870,10 @@ pub async fn register(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
 
     let mut record = if let Some(existing) = records.get(&config.name) {
         ensure!(
-            existing.status == DescriptorStatus::Syncing && existing.config == config,
+            existing.status == DescriptorStatus::Syncing
+                && !existing.initial_scan_complete
+                && existing.pending_rescan.is_none()
+                && existing.config == config,
             "descriptor '{}' is already registered",
             config.name
         );
@@ -731,6 +891,7 @@ pub async fn register(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
             last_used_index: None,
             status: DescriptorStatus::Syncing,
             initial_scan_complete: false,
+            pending_rescan: None,
             incident: None,
             last_success_at: None,
             generation: None,
@@ -754,8 +915,10 @@ pub async fn register(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
                 )
             })
             .collect::<Vec<_>>();
-        let scan = match cln::scan_watch_set(
-            &plugin.state().rpc_path,
+        let scan = match scan_watch_set_with_progress(
+            &plugin,
+            &request_context,
+            &record.config.name,
             &transient_watches,
             record.config.birthheight,
         )
@@ -775,35 +938,16 @@ pub async fn register(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
                 return Err(error);
             }
         };
-        ensure!(
-            scan.start_block == record.config.birthheight
-                && scan.blocks_processed
-                    == if scan.start_block > scan.target_block {
-                        0
-                    } else {
-                        u64::from(scan.target_block - scan.start_block) + 1
-                    },
-            "bwatch returned an incomplete wallet scan"
-        );
-        for mut event in scan.matches {
-            event.historical_scan = true;
-            if let Err(error) = crate::events::on_bwatch_match(
-                plugin.clone(),
-                serde_json::to_value(event).context("serializing historical match")?,
+        if let Err(error) = apply_historical_scan(&plugin, record.config.birthheight, scan).await {
+            report_descriptor_failure(
+                plugin.state(),
+                &record.config.name,
+                "register",
+                &error,
+                false,
             )
-            .await
-            .context("applying historical descriptor match")
-            {
-                report_descriptor_failure(
-                    plugin.state(),
-                    &record.config.name,
-                    "register",
-                    &error,
-                    false,
-                )
-                .await;
-                return Err(error);
-            }
+            .await;
+            return Err(error);
         }
     }
 
@@ -842,6 +986,176 @@ pub async fn register(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
         .await
         .context("activating descriptor")?;
     let response = record_view(&record, &descriptor);
+    plugin.state().put_record(record).await;
+    Ok(response)
+}
+
+pub async fn rescan(
+    plugin: Plugin<AppState>,
+    request_context: RequestContext,
+    args: Value,
+) -> Result<Value> {
+    let request: RescanRequest = parse_request(args, &["name", "start_block", "lookahead"])?;
+    if let Some(lookahead) = request.lookahead {
+        validate_lookahead(lookahead)?;
+    }
+
+    let operation = plugin.state().lock_descriptor(&request.name).await;
+    let records = plugin.state().records_snapshot().await;
+    let old = records
+        .get(&request.name)
+        .cloned()
+        .with_context(|| format!("descriptor '{}' is not registered", request.name))?;
+    ensure!(
+        old.status != DescriptorStatus::Deleting,
+        "descriptor '{}' is being deleted",
+        request.name
+    );
+    ensure!(
+        old.initial_scan_complete,
+        "descriptor '{}' has an interrupted initial scan; retry tracker-register with the same configuration",
+        request.name
+    );
+    let descriptor = validate_config(&old.config, &plugin.state().network)?;
+    let requested_lookahead = request.lookahead.unwrap_or(old.config.lookahead);
+    if !descriptor.is_ranged() {
+        ensure!(
+            requested_lookahead == 1,
+            "non-ranged descriptors require lookahead=1"
+        );
+    }
+    let requested_start = request
+        .start_block
+        .or_else(|| {
+            old.pending_rescan
+                .as_ref()
+                .map(|pending| pending.start_block)
+        })
+        .unwrap_or(old.config.birthheight);
+    ensure!(
+        requested_start >= old.config.birthheight,
+        "start_block cannot be earlier than descriptor birthheight {}",
+        old.config.birthheight
+    );
+
+    let mut record = if let Some(pending) = &old.pending_rescan {
+        ensure!(
+            old.status == DescriptorStatus::Syncing
+                && pending.start_block == requested_start
+                && old.config.lookahead == requested_lookahead,
+            "descriptor '{}' has an interrupted rescan; retry start_block={} lookahead={} first",
+            request.name,
+            pending.start_block,
+            old.config.lookahead
+        );
+        old
+    } else {
+        ensure!(
+            old.status == DescriptorStatus::Active,
+            "descriptor '{}' has another interrupted operation; reconcile it before rescanning",
+            request.name
+        );
+        let new_end = desired_range_end(old.last_used_index, requested_lookahead)?;
+        let desired_scripts = descriptor.derive_range(0, new_end)?;
+        ensure_no_script_overlap(
+            &old.config.name,
+            &desired_scripts,
+            &records,
+            &plugin.state().network,
+        )?;
+        let mut updated = old;
+        updated.config.lookahead = requested_lookahead;
+        updated.range_end = new_end;
+        updated.status = DescriptorStatus::Syncing;
+        updated.pending_rescan = Some(PendingRescan {
+            start_block: requested_start,
+        });
+        cln::save_record(&plugin.state().rpc_path, &mut updated)
+            .await
+            .context("persisting descriptor rescan intent")?;
+        plugin.state().put_record(updated.clone()).await;
+        updated
+    };
+
+    let scan_scripts = descriptor
+        .derive_range(0, record.range_end)
+        .context("deriving descriptor rescan range")?;
+    let transient_watches = scan_scripts
+        .into_iter()
+        .map(|script| {
+            (
+                script_owner(&record.config.name, script.branch, script.index),
+                script.scriptpubkey,
+            )
+        })
+        .collect::<Vec<_>>();
+    drop(operation);
+
+    let scan = match scan_watch_set_with_progress(
+        &plugin,
+        &request_context,
+        &record.config.name,
+        &transient_watches,
+        requested_start,
+    )
+    .await
+    .context("rescanning descriptor history in one block pass")
+    {
+        Ok(scan) => scan,
+        Err(error) => {
+            report_descriptor_failure(plugin.state(), &record.config.name, "rescan", &error, false)
+                .await;
+            return Err(error);
+        }
+    };
+    let summary = match apply_historical_scan(&plugin, requested_start, scan).await {
+        Ok(summary) => summary,
+        Err(error) => {
+            report_descriptor_failure(plugin.state(), &record.config.name, "rescan", &error, false)
+                .await;
+            return Err(error);
+        }
+    };
+
+    let _operation = plugin.state().lock_descriptor(&record.config.name).await;
+    record = plugin
+        .state()
+        .record(&record.config.name)
+        .await
+        .context("descriptor disappeared while applying historical rescan")?;
+    ensure!(
+        record
+            .pending_rescan
+            .as_ref()
+            .is_some_and(|pending| { pending.start_block == requested_start }),
+        "descriptor rescan operation changed while its scan was running"
+    );
+    if let Err(error) = reconcile_watches(plugin.state(), &record, false)
+        .await
+        .context("installing descriptor watches after historical rescan")
+    {
+        plugin.state().put_record(record.clone()).await;
+        drop(_operation);
+        report_descriptor_failure(plugin.state(), &record.config.name, "rescan", &error, false)
+            .await;
+        return Err(error);
+    }
+    record.pending_rescan = None;
+    record.status = DescriptorStatus::Active;
+    mark_success(&mut record, "rescan");
+    cln::save_record(&plugin.state().rpc_path, &mut record)
+        .await
+        .context("activating rescanned descriptor")?;
+    let descriptor = validate_config(&record.config, &plugin.state().network)?;
+    let mut response = record_view(&record, &descriptor);
+    response["rescan"] = json!({
+        "start_block": summary.start_block,
+        "target_block": summary.target_block,
+        "blocks_processed": summary.blocks_processed,
+        "matches_found": summary.matches_found,
+        "deposits_matched": summary.deposits_matched,
+        "spends_matched": summary.spends_matched,
+    });
     plugin.state().put_record(record).await;
     Ok(response)
 }
@@ -939,6 +1253,11 @@ pub async fn update(plugin: Plugin<AppState>, args: Value) -> Result<Value> {
         );
     }
     if old.status == DescriptorStatus::Syncing {
+        ensure!(
+            old.pending_rescan.is_none(),
+            "descriptor '{}' has an interrupted rescan; retry tracker-rescan first",
+            request.name
+        );
         ensure!(
             old.initial_scan_complete,
             "descriptor '{}' has an interrupted initial scan; retry tracker-register with the same configuration",
@@ -1305,6 +1624,7 @@ pub fn record_view(record: &DescriptorRecord, descriptor: &DescriptorSet) -> Val
         "range_end": record.range_end,
         "last_used_index": record.last_used_index,
         "status": record.status,
+        "pending_rescan": record.pending_rescan,
         "incident": record.incident,
         "last_success_at": record.last_success_at,
         "branches": descriptor.branch_count(),
@@ -1344,6 +1664,26 @@ mod tests {
     }
 
     #[test]
+    fn rescan_parameters_are_optional() {
+        let request: RescanRequest = parse_request(
+            json!({ "name": "treasury" }),
+            &["name", "start_block", "lookahead"],
+        )
+        .unwrap();
+        assert_eq!(request.name, "treasury");
+        assert_eq!(request.start_block, None);
+        assert_eq!(request.lookahead, None);
+
+        let request: RescanRequest = parse_request(
+            json!(["treasury", 850_000, 500]),
+            &["name", "start_block", "lookahead"],
+        )
+        .unwrap();
+        assert_eq!(request.start_block, Some(850_000));
+        assert_eq!(request.lookahead, Some(500));
+    }
+
+    #[test]
     fn lookahead_is_a_gap_beyond_the_last_used_index() {
         assert_eq!(desired_range_end(None, 20).unwrap(), 20);
         assert_eq!(desired_range_end(Some(7), 20).unwrap(), 28);
@@ -1355,6 +1695,17 @@ mod tests {
         assert!(!movement_is_mature(100, 2, 100));
         assert!(movement_is_mature(100, 2, 101));
         assert!(!movement_is_mature(u32::MAX, 2, u32::MAX));
+    }
+
+    #[test]
+    fn block_counts_map_to_zero_indexed_rpc_progress() {
+        assert_eq!(rpc_progress(0, 100), None);
+        assert_eq!(rpc_progress(1, 100), Some((0, 100)));
+        assert_eq!(rpc_progress(50, 100), Some((49, 100)));
+        assert_eq!(rpc_progress(100, 100), Some((99, 100)));
+        assert_eq!(rpc_progress(101, 100), Some((99, 100)));
+        assert_eq!(rpc_progress(1, 1), None);
+        assert_eq!(rpc_progress(1, u64::from(u32::MAX) + 1), None);
     }
 
     #[test]
@@ -1470,6 +1821,7 @@ mod tests {
                 last_used_index: None,
                 status: DescriptorStatus::Active,
                 initial_scan_complete: true,
+                pending_rescan: None,
                 incident: None,
                 last_success_at: None,
                 generation: None,

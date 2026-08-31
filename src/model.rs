@@ -68,11 +68,18 @@ pub struct DescriptorRecord {
     #[serde(default = "default_true")]
     pub initial_scan_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_rescan: Option<PendingRescan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incident: Option<TrackerIncident>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_success_at: Option<u64>,
     #[serde(skip)]
     pub generation: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PendingRescan {
+    pub start_block: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -131,6 +138,15 @@ pub struct UpdateRequest {
     pub lookahead: Option<u32>,
     #[serde(default)]
     pub confirmations: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RescanRequest {
+    pub name: String,
+    #[serde(default)]
+    pub start_block: Option<u32>,
+    #[serde(default)]
+    pub lookahead: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -292,5 +308,6 @@ mod tests {
         assert!(record.initial_scan_complete);
         assert_eq!(record.config.confirmations, DEFAULT_CONFIRMATIONS);
         assert!(record.pending_movements.is_empty());
+        assert!(record.pending_rescan.is_none());
     }
 }

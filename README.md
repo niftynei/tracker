@@ -69,6 +69,13 @@ lightning-cli tracker-register \
   confirmations=6
 ~~~
 
+For a historical registration, `lightning-cli` displays a request-scoped
+progress bar using bwatch's completed and total block counts. Tracker polls the
+in-process bwatch status once per second; it does not fetch blocks itself or
+open another network service. Automated callers that require JSON-only output
+can use `lightning-cli --notifications=none tracker-register ...` and inspect
+the same live scan through `tracker-health` from another client.
+
 Inspect:
 
 ~~~console
@@ -89,6 +96,28 @@ The lookahead may increase or decrease. Decreasing it does not discard already
 discovered UTXOs; their spend watches remain active. A confirmation change
 applies to pending and future movements. Increasing it cannot retract movements
 already accepted by Bookkeeper.
+
+Rescan a registered descriptor in one historical block pass:
+
+~~~console
+lightning-cli tracker-rescan \
+  name=treasury \
+  start_block=875000 \
+  lookahead=500
+~~~
+
+Both `start_block` and `lookahead` are optional. The start defaults to the
+descriptor's immutable birthheight and the lookahead defaults to its current
+gap limit. When supplied, lookahead becomes the descriptor's persistent gap
+limit. `start_block` cannot precede the birthheight; unregister and register a
+replacement record to move that boundary earlier.
+
+The rescan uses a transient wallet set and dynamically follows outputs found
+during the scan, so a deposit and its later spend are discovered in the same
+block pass. The operation persists its intent before scanning, streams
+request-scoped block progress, and can be resumed with the same
+`tracker-rescan` arguments after an interruption. Its result includes the scan
+range, processed block count, and deposit/spend match counts.
 
 Reconcile expected watches and retry every mature, pending Bookkeeper movement:
 

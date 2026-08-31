@@ -6,7 +6,7 @@ mod tracker;
 
 use crate::events::{on_bwatch_block_processed, on_bwatch_block_reverted, on_bwatch_match};
 use crate::tracker::{
-    AppState, ack_incident, health, inspect, list, load, metrics, reconcile, register,
+    AppState, ack_incident, health, inspect, list, load, metrics, reconcile, register, rescan,
     restore_watches, unregister, update,
 };
 use anyhow::{Context, Result};
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 async fn main() -> Result<()> {
     let Some(configured) = Builder::new(tokio::io::stdin(), tokio::io::stdout())
         .rpcmethod_from_builder(
-            RpcMethodBuilder::new("tracker-register", register)
+            RpcMethodBuilder::new_with_context("tracker-register", register)
                 .description("Register a checksummed output descriptor with bwatch")
                 .usage("name descriptor birthheight [lookahead] [confirmations]"),
         )
@@ -35,6 +35,11 @@ async fn main() -> Result<()> {
             RpcMethodBuilder::new("tracker-update", update)
                 .description("Change a registered descriptor's lookahead or confirmation depth")
                 .usage("name [lookahead] [confirmations]"),
+        )
+        .rpcmethod_from_builder(
+            RpcMethodBuilder::new_with_context("tracker-rescan", rescan)
+                .description("Rescan a registered descriptor in one historical block pass")
+                .usage("name [start_block] [lookahead]"),
         )
         .rpcmethod_from_builder(
             RpcMethodBuilder::new("tracker-reconcile", reconcile)
