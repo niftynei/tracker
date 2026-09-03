@@ -476,6 +476,18 @@ pub async fn deliver_mature_movements(
                 .await
                 .context("injecting durable Bookkeeper spend")?;
             }
+            MovementKind::ExternalDeposit => {
+                cln::inject_external_deposit(
+                    &state.rpc_path,
+                    &record.config.name,
+                    &movement.outpoint,
+                    movement.amount_msat,
+                    movement.timestamp,
+                    movement.blockheight,
+                )
+                .await
+                .context("injecting durable external Bookkeeper deposit")?;
+            }
         }
         record.pending_movements.remove(&movement_id);
         mark_success(record, "bookkeeper_delivery");
@@ -1022,7 +1034,7 @@ struct HistoricalScanSummary {
 async fn apply_historical_scan(
     plugin: &Plugin<AppState>,
     expected_start_block: u32,
-    scan: crate::model::BwatchScanResult,
+    mut scan: crate::model::BwatchScanResult,
 ) -> Result<HistoricalScanSummary> {
     let expected_blocks = if scan.start_block > scan.target_block {
         0
@@ -1053,6 +1065,19 @@ async fn apply_historical_scan(
         )
         .unwrap_or(u64::MAX),
     };
+    // Within a block, record descriptor-owned outputs before processing
+    // spends. That ensures same-transaction change is never mistaken for an
+    // external recipient during historical repair.
+    scan.matches.sort_by_key(|event| {
+        (
+            event.blockheight,
+            if event.watch_type == "scriptpubkey" {
+                0
+            } else {
+                1
+            },
+        )
+    });
     for mut event in scan.matches {
         event.historical_scan = true;
         crate::events::on_bwatch_match(
@@ -1125,6 +1150,7 @@ pub async fn register(
             config,
             utxos: BTreeMap::new(),
             pending_movements: BTreeMap::new(),
+            external_outpoints: BTreeSet::new(),
             next_indexes: BTreeMap::new(),
             range_ends: initial_range_ends,
             last_used_indexes: BTreeMap::new(),
@@ -2170,6 +2196,7 @@ pub fn record_view(record: &DescriptorRecord, descriptor: &DescriptorSet) -> Val
         "range_ends": record.range_ends,
         "last_used_indexes": record.last_used_indexes,
         "tracked_utxos": record.utxos.values().collect::<Vec<_>>(),
+        "external_outpoints": record.external_outpoints,
         "pending_movements": record.pending_movements.values().collect::<Vec<_>>(),
     })
 }
@@ -2374,6 +2401,7 @@ mod tests {
                 config,
                 utxos: BTreeMap::new(),
                 pending_movements: BTreeMap::new(),
+                external_outpoints: BTreeSet::new(),
                 next_indexes: BTreeMap::new(),
                 range_ends: BTreeMap::from([(0, 1)]),
                 last_used_indexes: BTreeMap::new(),

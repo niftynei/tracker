@@ -12,6 +12,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use cln_plugin::Plugin;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn parse_notification<T: DeserializeOwned>(topic: &str, value: Value) -> Result<T> {
     let payload = value.get(topic).cloned().unwrap_or(value);
@@ -36,6 +37,98 @@ fn deposit_movement_id(outpoint: &str) -> String {
 
 fn spend_movement_id(outpoint: &str, spending_txid: &str) -> String {
     format!("spend:{outpoint}:{spending_txid}")
+}
+
+fn external_movement_id(outpoint: &str) -> String {
+    format!("external:{outpoint}")
+}
+
+fn descriptor_scripts(
+    records: &BTreeMap<String, crate::model::DescriptorRecord>,
+    network: &str,
+) -> Result<BTreeSet<String>> {
+    let mut scripts = BTreeSet::new();
+    for record in records.values() {
+        let descriptor = validate_config(&record.config, network)?;
+        for branch in
+            0..u32::try_from(descriptor.branch_count()).context("too many descriptor branches")?
+        {
+            let end = record
+                .range_ends
+                .get(&branch)
+                .copied()
+                .unwrap_or(record.range_end);
+            scripts.extend(
+                descriptor
+                    .derive_branch_range(branch, 0, end)?
+                    .into_iter()
+                    .map(|script| script.scriptpubkey),
+            );
+        }
+    }
+    Ok(scripts)
+}
+
+fn queue_external_outputs(
+    record: &mut crate::model::DescriptorRecord,
+    records: &BTreeMap<String, crate::model::DescriptorRecord>,
+    tx: &miniscript::bitcoin::Transaction,
+    timestamp: u64,
+    blockheight: u32,
+    network: &str,
+) -> Result<usize> {
+    let source_accounts = records
+        .iter()
+        .filter(|(_, candidate)| {
+            tx.input.iter().any(|input| {
+                candidate
+                    .utxos
+                    .contains_key(&input.previous_output.to_string())
+            })
+        })
+        .map(|(name, _)| name.as_str())
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        source_accounts.len() == 1 && source_accounts.contains(record.config.name.as_str()),
+        "spend transaction {} combines inputs from Tracker accounts {:?}; external-output attribution requires one source account",
+        tx.compute_txid(),
+        source_accounts
+    );
+
+    let owned_scripts = descriptor_scripts(records, network)?;
+    let txid = tx.compute_txid().to_string();
+    let mut added = 0;
+    for (index, output) in tx.output.iter().enumerate() {
+        let script = hex::encode(output.script_pubkey.as_bytes());
+        if owned_scripts.contains(&script) || output.value.to_sat() == 0 {
+            continue;
+        }
+        let outpoint = format!("{txid}:{index}");
+        if !record.external_outpoints.insert(outpoint.clone()) {
+            continue;
+        }
+        let amount_msat = output
+            .value
+            .to_sat()
+            .checked_mul(1_000)
+            .context("external output amount does not fit in millisatoshis")?;
+        let id = external_movement_id(&outpoint);
+        record.pending_movements.insert(
+            id.clone(),
+            PendingMovement {
+                id,
+                kind: MovementKind::ExternalDeposit,
+                outpoint,
+                amount_msat,
+                blockheight,
+                timestamp,
+                spending_txid: None,
+                description: None,
+            },
+        );
+        added += 1;
+    }
+    Ok(added)
 }
 
 fn descriptor_name(owner: &WatchOwner) -> &str {
@@ -328,15 +421,9 @@ async fn handle_spend(
         .utxos
         .get(&outpoint)
         .with_context(|| format!("unknown tracked outpoint {outpoint}"))?;
-    if persisted.spent_by.as_deref() == Some(&spending_txid) {
-        if original.pending_movements.contains_key(&movement_id) {
-            let tip = current_bwatch_height(plugin.state(), event.blockheight).await;
-            deliver_and_store(plugin.state(), original, tip).await?;
-        }
-        return Ok(());
-    }
+    let already_spent = persisted.spent_by.as_deref() == Some(&spending_txid);
     ensure!(
-        persisted.spent_by.is_none(),
+        already_spent || persisted.spent_by.is_none(),
         "tracked outpoint already has a different spend"
     );
     let amount_msat = persisted.amount_msat;
@@ -344,7 +431,29 @@ async fn handle_spend(
         Some(timestamp) => timestamp,
         None => cln::block_timestamp(&plugin.state().rpc_path, event.blockheight).await?,
     };
+    let records = plugin.state().records_snapshot().await;
     let mut updated = original;
+    let external_added = queue_external_outputs(
+        &mut updated,
+        &records,
+        &tx,
+        timestamp,
+        event.blockheight,
+        &plugin.state().network,
+    )?;
+    if already_spent {
+        if external_added > 0 {
+            cln::save_record(&plugin.state().rpc_path, &mut updated)
+                .await
+                .context("persisting repaired external outputs")?;
+            plugin.state().put_record(updated.clone()).await;
+        }
+        if !updated.pending_movements.is_empty() {
+            let tip = current_bwatch_height(plugin.state(), event.blockheight).await;
+            deliver_and_store(plugin.state(), updated, tip).await?;
+        }
+        return Ok(());
+    }
     let utxo = updated.utxos.get_mut(&outpoint).expect("cloned above");
     utxo.spent_by = Some(spending_txid.clone());
     utxo.spent_height = Some(event.blockheight);
@@ -449,6 +558,9 @@ async fn revert_at_height(plugin: Plugin<AppState>, name: String, blockheight: u
                     utxo.spent_height = None;
                 }
             }
+            MovementKind::ExternalDeposit => {
+                updated.external_outpoints.remove(&movement.outpoint);
+            }
         }
     }
 
@@ -534,5 +646,6 @@ mod tests {
     fn movement_ids_are_owner_path_safe() {
         assert_eq!(deposit_movement_id("00aa:1"), "deposit:00aa:1");
         assert_eq!(spend_movement_id("00aa:1", "bbcc"), "spend:00aa:1:bbcc");
+        assert_eq!(external_movement_id("bbcc:0"), "external:bbcc:0");
     }
 }

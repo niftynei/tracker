@@ -293,6 +293,30 @@ pub async fn inject_utxo_deposit(
     Ok(())
 }
 
+pub async fn inject_external_deposit(
+    path: &Path,
+    transfer_from: &str,
+    outpoint: &str,
+    amount_msat: u64,
+    timestamp: u64,
+    blockheight: u32,
+) -> Result<()> {
+    call(
+        path,
+        "injectutxodeposit",
+        json!({
+            "account": "external",
+            "transfer_from": transfer_from,
+            "outpoint": outpoint,
+            "amount_msat": format!("{amount_msat}msat"),
+            "timestamp": timestamp,
+            "blockheight": blockheight,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn describe_utxo(path: &Path, outpoint: &str, description: &str) -> Result<()> {
     call(
         path,

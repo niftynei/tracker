@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const STORE_PREFIX: &str = "tracker";
 pub const STORE_DESCRIPTORS: &str = "descriptors";
@@ -26,6 +26,7 @@ pub struct DescriptorConfig {
 pub enum MovementKind {
     Deposit,
     Spend,
+    ExternalDeposit,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -79,6 +80,10 @@ pub struct DescriptorRecord {
     pub utxos: BTreeMap<String, TrackedUtxo>,
     #[serde(default)]
     pub pending_movements: BTreeMap<String, PendingMovement>,
+    /// Recipient outputs already attributed to this descriptor. Keeping this
+    /// durable makes live notifications and historical rescans idempotent.
+    #[serde(default)]
+    pub external_outpoints: BTreeSet<String>,
     #[serde(default)]
     pub next_indexes: BTreeMap<u32, u32>,
     #[serde(default)]

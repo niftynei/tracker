@@ -182,6 +182,16 @@ request-scoped block progress, and can be resumed with the same
 `tracker-rescan` arguments after an interruption. Its result includes the scan
 range, processed block count, and deposit/spend match counts.
 
+For every spend funded by one registered Tracker account, Tracker also records
+each non-Tracker recipient output as a Bookkeeper `external` deposit with
+`transfer_from` set to the descriptor name. Descriptor-owned change is excluded.
+This lets Bookkeeper distinguish the amount sent from the transaction fee.
+External outpoints are persisted, so replaying `tracker-rescan` repairs older
+spends that predate this behavior without duplicating outputs already repaired.
+Transactions combining inputs from multiple Tracker accounts are rejected for
+manual reconciliation rather than assigning the recipient amount to the wrong
+account.
+
 Reconcile expected watches and retry every mature, pending Bookkeeper movement:
 
 ~~~console

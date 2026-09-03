@@ -225,6 +225,9 @@ scan_registered="$(ln_cli -N none tracker-inspect name=wide-scan)"
 assert_jq "$scan_registered" \
   ".name == \"wide-scan\" and .lookahead == 64 and .range_end == 116 and .last_used_index == 51 and .status == \"active\" and (.tracked_utxos | length) == 1 and .tracked_utxos[0].spent_by == \"$scan_spend_txid\"" \
   "single-pass descriptor registration missed the historical deposit or spend (inspect=$scan_registered)"
+assert_jq "$(ln_cli bkpr-listaccountevents account=external)" \
+  ".events | map(select(.origin == \"wide-scan\" and (.outpoint | startswith(\"$scan_spend_txid:\")))) | length == 1" \
+  'historical registration did not reconstruct the external recipient output'
 assert_jq "$(ln_cli listwatch)" \
   '[.watches[].owners[] | select(startswith("plugin/tracker/wide-scan/spk/"))] | length == 116' \
   'descriptor registration did not persist the extended lookahead frontier'
@@ -270,6 +273,9 @@ rescanned="$(ln_cli -N none tracker-inspect name=wide-scan)"
 assert_jq "$rescanned" \
   ".name == \"wide-scan\" and .lookahead == 100 and .range_end == 220 and .last_used_index == 119 and .status == \"active\" and .pending_rescan == null and (.tracked_utxos | length) == 2 and ([.tracked_utxos[] | select(.spent_by == \"$rescan_spend_txid\")] | length) == 1" \
   'tracker-rescan missed the beyond-frontier deposit or its later spend'
+assert_jq "$(ln_cli bkpr-listaccountevents account=external)" \
+  ".events | map(select(.origin == \"wide-scan\" and (.outpoint | startswith(\"$rescan_spend_txid:\")))) | length == 1" \
+  'explicit rescan did not reconstruct the external recipient output'
 assert_jq "$(ln_cli listwatch)" \
   '[.watches[].owners[] | select(startswith("plugin/tracker/wide-scan/spk/"))] | length == 220' \
   'tracker-rescan did not persist the widened descriptor frontier'
@@ -505,6 +511,18 @@ wait_for_jq \
   ".events | map(select(.account == \"treasury\" and .outpoint == \"$outpoint\" and .debit_msat != 0 and .debit_msat != \"0msat\")) | length == 1" \
   'Bookkeeper did not receive exactly one spend' \
   ln_cli bkpr-listaccountevents >/dev/null
+wait_for_jq \
+  ".events | map(select(.account == \"external\" and .origin == \"treasury\" and (.outpoint | startswith(\"$spend_txid:\")) and .credit_msat != 0 and .credit_msat != \"0msat\")) | length == 1" \
+  'Bookkeeper did not receive the external recipient output' \
+  ln_cli bkpr-listaccountevents >/dev/null
+assert_jq "$(ln_cli bkpr-listincome consolidate_fees=true)" \
+  "def msat: if type == \"number\" then . elif type == \"string\" then sub(\"msat$\"; \"\") | tonumber else .msat end; [.income_events[] | select(.account == \"treasury\" and .tag == \"onchain_fee\" and .txid == \"$spend_txid\") | .debit_msat | msat] == [100000000]" \
+  'Bookkeeper did not consolidate the Tracker spend fee after receiving its external output'
+spend_height="$(btc_cli getblockcount)"
+ln_cli -N none tracker-rescan name=treasury start_block="$spend_height" >/dev/null
+assert_jq "$(ln_cli bkpr-listaccountevents account=external)" \
+  ".events | map(select(.origin == \"treasury\" and (.outpoint | startswith(\"$spend_txid:\")))) | length == 1" \
+  'replaying a known spend duplicated its external recipient output'
 
 # Unregister removes every owned watch and the persisted Tracker view, while
 # Bookkeeper history remains intact.
