@@ -10,6 +10,7 @@ use crate::tracker::{
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use cln_plugin::Plugin;
+use miniscript::bitcoin::{Address, Network, Script};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,6 +42,24 @@ fn spend_movement_id(outpoint: &str, spending_txid: &str) -> String {
 
 fn external_movement_id(outpoint: &str) -> String {
     format!("external:{outpoint}")
+}
+
+fn external_description_movement_id(outpoint: &str) -> String {
+    format!("external-description:{outpoint}")
+}
+
+fn external_output_address(script: &Script, network: &str) -> Result<Option<String>> {
+    let network = match network {
+        "bitcoin" => Network::Bitcoin,
+        "testnet" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "signet" => Network::Signet,
+        "regtest" => Network::Regtest,
+        other => return Err(anyhow!("unsupported CLN network '{other}'")),
+    };
+    Ok(Address::from_script(script, network)
+        .ok()
+        .map(|address| address.to_string()))
 }
 
 fn descriptor_scripts(
@@ -104,26 +123,37 @@ fn queue_external_outputs(
             continue;
         }
         let outpoint = format!("{txid}:{index}");
-        if !record.external_outpoints.insert(outpoint.clone()) {
-            continue;
-        }
         let amount_msat = output
             .value
             .to_sat()
             .checked_mul(1_000)
             .context("external output amount does not fit in millisatoshis")?;
-        let id = external_movement_id(&outpoint);
+        let description = external_output_address(&output.script_pubkey, network)?;
+        let deposit_id = external_movement_id(&outpoint);
+        let (id, kind) = if record.external_outpoints.insert(outpoint.clone()) {
+            (deposit_id, MovementKind::ExternalDeposit)
+        } else {
+            // A pending deposit has not reached Bookkeeper yet. Do not place a
+            // description repair ahead of it in the delivery queue.
+            if record.pending_movements.contains_key(&deposit_id) || description.is_none() {
+                continue;
+            }
+            (
+                external_description_movement_id(&outpoint),
+                MovementKind::ExternalDescription,
+            )
+        };
         record.pending_movements.insert(
             id.clone(),
             PendingMovement {
                 id,
-                kind: MovementKind::ExternalDeposit,
+                kind,
                 outpoint,
                 amount_msat,
                 blockheight,
                 timestamp,
                 spending_txid: None,
-                description: None,
+                description,
             },
         );
         added += 1;
@@ -561,6 +591,7 @@ async fn revert_at_height(plugin: Plugin<AppState>, name: String, blockheight: u
             MovementKind::ExternalDeposit => {
                 updated.external_outpoints.remove(&movement.outpoint);
             }
+            MovementKind::ExternalDescription => {}
         }
     }
 
@@ -647,5 +678,20 @@ mod tests {
         assert_eq!(deposit_movement_id("00aa:1"), "deposit:00aa:1");
         assert_eq!(spend_movement_id("00aa:1", "bbcc"), "spend:00aa:1:bbcc");
         assert_eq!(external_movement_id("bbcc:0"), "external:bbcc:0");
+        assert_eq!(
+            external_description_movement_id("bbcc:0"),
+            "external-description:bbcc:0"
+        );
+    }
+
+    #[test]
+    fn derives_external_output_address_without_persisting_the_script() {
+        let script = miniscript::bitcoin::ScriptBuf::from_bytes(
+            hex::decode("0014bef5a2f9a56a94aab12459f72ad9cf8cf19c7bbe").unwrap(),
+        );
+        assert_eq!(
+            external_output_address(&script, "bitcoin").unwrap(),
+            Some("bc1qhm6697d9d2224vfyt8mj4kw03ncec7a7fdafvt".to_owned())
+        );
     }
 }

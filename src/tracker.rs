@@ -487,6 +487,20 @@ pub async fn deliver_mature_movements(
                 )
                 .await
                 .context("injecting durable external Bookkeeper deposit")?;
+                if let Some(description) = movement.description.as_deref() {
+                    cln::describe_utxo(&state.rpc_path, &movement.outpoint, description)
+                        .await
+                        .context("describing durable external Bookkeeper deposit")?;
+                }
+            }
+            MovementKind::ExternalDescription => {
+                let description = movement
+                    .description
+                    .as_deref()
+                    .context("external description repair omitted its description")?;
+                cln::describe_utxo(&state.rpc_path, &movement.outpoint, description)
+                    .await
+                    .context("repairing external Bookkeeper description")?;
             }
         }
         record.pending_movements.remove(&movement_id);

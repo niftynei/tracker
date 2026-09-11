@@ -186,8 +186,18 @@ For every spend funded by one registered Tracker account, Tracker also records
 each non-Tracker recipient output as a Bookkeeper `external` deposit with
 `transfer_from` set to the descriptor name. Descriptor-owned change is excluded.
 This lets Bookkeeper distinguish the amount sent from the transaction fee.
+While processing the raw transaction, Tracker converts every standard external
+output script to its network-correct Bitcoin address and writes that address to
+the Bookkeeper event with `bkpr-editdescriptionbyoutpoint`. The address exists in
+Tracker only in the pending delivery record and is removed after Bookkeeper has
+accepted it; Tracker does not retain an external-address or script database.
 External outpoints are persisted, so replaying `tracker-rescan` repairs older
 spends that predate this behavior without duplicating outputs already repaired.
+For an already-known external outpoint, the replay creates only a transient
+description repair and does not inject the monetary movement again.
+An address-repair rescan must begin at or before the tracked input's deposit
+block so bwatch can rediscover that output and follow its later spend; omitting
+`start_block` uses the descriptor birthheight and is the safest full repair.
 Transactions combining inputs from multiple Tracker accounts are rejected for
 manual reconciliation rather than assigning the recipient amount to the wrong
 account.

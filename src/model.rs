@@ -27,6 +27,7 @@ pub enum MovementKind {
     Deposit,
     Spend,
     ExternalDeposit,
+    ExternalDescription,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
