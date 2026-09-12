@@ -1282,6 +1282,15 @@ pub async fn register(
     Ok(response)
 }
 
+fn rescan_resume_parameters_match(
+    pending: &PendingRescan,
+    persisted_lookahead: u32,
+    requested_start: u32,
+    requested_lookahead: u32,
+) -> bool {
+    pending.start_block == requested_start && persisted_lookahead == requested_lookahead
+}
+
 pub async fn rescan(
     plugin: Plugin<AppState>,
     request_context: RequestContext,
@@ -1332,15 +1341,24 @@ pub async fn rescan(
 
     let mut record = if let Some(pending) = &old.pending_rescan {
         ensure!(
-            old.status == DescriptorStatus::Syncing
-                && pending.start_block == requested_start
-                && old.config.lookahead == requested_lookahead,
+            rescan_resume_parameters_match(
+                pending,
+                old.config.lookahead,
+                requested_start,
+                requested_lookahead,
+            ),
             "descriptor '{}' has an interrupted rescan; retry start_block={} lookahead={} first",
             request.name,
             pending.start_block,
             old.config.lookahead
         );
-        old
+        // pending_rescan is the durable operation marker. Older recovery paths
+        // could leave status=active alongside that marker; accepting the exact
+        // persisted parameters and restoring syncing heals that state without
+        // permitting a different scan to replace it.
+        let mut resumed = old;
+        resumed.status = DescriptorStatus::Syncing;
+        resumed
     } else {
         ensure!(
             old.status == DescriptorStatus::Active,
@@ -2263,6 +2281,16 @@ mod tests {
         .unwrap();
         assert_eq!(request.start_block, Some(850_000));
         assert_eq!(request.lookahead, Some(500));
+    }
+
+    #[test]
+    fn persisted_rescan_intent_is_resumable_with_exact_parameters() {
+        let pending = PendingRescan {
+            start_block: 825_000,
+        };
+        assert!(rescan_resume_parameters_match(&pending, 200, 825_000, 200));
+        assert!(!rescan_resume_parameters_match(&pending, 200, 825_001, 200));
+        assert!(!rescan_resume_parameters_match(&pending, 200, 825_000, 201));
     }
 
     #[test]
